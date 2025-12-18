@@ -26,7 +26,7 @@ The system helps HR teams to:
 - AI is used only where it adds value
 - Quizzes are standardized per job level
 - No autonomous hiring decisions
-- No RAG or document memory systems
+
 
 ---
 

@@ -3,7 +3,6 @@ import sys
 import json
 import re
 import mysql.connector
-from elasticsearch import Elasticsearch
 import subprocess
 import time
 from functools import lru_cache
@@ -12,6 +11,8 @@ import csv
 from io import StringIO
 from datetime import datetime, date
 from decimal import Decimal
+from collections import Counter
+from difflib import SequenceMatcher
 
 # --- FIX PATH ISSUES (works both from App/ and project root)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,11 +22,11 @@ if PARENT_DIR not in sys.path:
 
 # --- Dual import handling ---
 try:
-    from App.config import DB_CONFIG, ES_CONFIG
+    from App.config import DB_CONFIG
     from App.resume_parser.parser import ResumeParser
     from App.resume_parser import utils as parser_utils
 except ModuleNotFoundError:
-    from config import DB_CONFIG, ES_CONFIG
+    from config import DB_CONFIG
     from resume_parser.parser import ResumeParser
     from resume_parser import utils as parser_utils
 
@@ -40,51 +41,6 @@ def connect_mysql():
     except Exception as e:
         print("[DB ERROR] Unable to connect to MySQL:", e)
         return None
-
-
-# ------------------------------------------------------
-# ELASTICSEARCH CONNECTION
-# ------------------------------------------------------
-def connect_es(auto_start=True, wait_seconds=6):
-    """Connect to Elasticsearch; optionally try to start it if down."""
-    host = ES_CONFIG.get("host", "http://127.0.0.1:9200")
-    def _client():
-        return Elasticsearch(
-            hosts=[host],
-            verify_certs=False,
-            request_timeout=ES_CONFIG.get("timeout", 30),
-            max_retries=ES_CONFIG.get("max_retries", 3),
-            retry_on_timeout=ES_CONFIG.get("retry_on_timeout", True),
-        )
-
-    try:
-        es = _client()
-        if es.ping():
-            return es
-    except Exception:
-        pass
-
-    if not auto_start:
-        print("[ES] Elasticsearch not reachable; skipping.")
-        return None
-
-    # Try to start ES via start_es.sh if present
-    start_script = os.path.join(PARENT_DIR, "start_es.sh")
-    if os.path.exists(start_script):
-        try:
-            subprocess.Popen(["bash", start_script], cwd=os.path.dirname(start_script))
-            time.sleep(wait_seconds)
-            es = _client()
-            if es.ping():
-                print("[ES] Elasticsearch started and reachable.")
-                return es
-            print("[ES] Elasticsearch still not reachable after start attempt.")
-        except Exception as e:
-            print("[ES] Failed to auto-start Elasticsearch:", e)
-    else:
-        print(f"[ES] start_es.sh not found at {start_script}; cannot auto-start.")
-
-    return None
 
 
 # ------------------------------------------------------
@@ -126,37 +82,13 @@ def insert_resume_to_db(parsed_data):
 
 
 # ------------------------------------------------------
-# ELASTICSEARCH INDEXING
+# FULL PIPELINE: PARSE DB PIPELINE
 # ------------------------------------------------------
-def index_resume_to_es(parsed_data):
-    """Index parsed résumé into Elasticsearch for fast search."""
-    es = connect_es(auto_start=True)
-    if not es:
-        return False
-
-    try:
-        es.index(index="candidates", document=parsed_data)
-        print("[ES] Resume indexed successfully.")
-        return True
-    except Exception as e:
-        print("[ES ERROR] Failed to index resume:", e)
-        traceback.print_exc()
-        return False
-
-
-# ------------------------------------------------------
-# FULL PIPELINE: PARSE → DB → SEARCH SYNC
-# ------------------------------------------------------
-import os
-import json
-import mysql.connector
-from elasticsearch import Elasticsearch
-from App.config import DB_CONFIG, ES_CONFIG
-from App.resume_parser.parser import ResumeParser
-from App.resume_parser import utils as parser_utils
 
 # synonym cache to reduce DB hits
 _SYN_CACHE = {"ts": 0, "map": {}}
+# role cache for fuzzy matching
+_ROLE_CACHE = {"ts": 0, "names": []}
 
 
 def _serialize_value(value):
@@ -192,6 +124,94 @@ def _build_resume_label(first_name, last_name, email, phone):
     return normalized or "resume"
 
 
+def _get_known_role_names():
+    """Return cached role names from jd_roles (cache ttl ~5 minutes)."""
+    now_ts = time.time()
+    if now_ts - _ROLE_CACHE["ts"] < 300 and _ROLE_CACHE["names"]:
+        return _ROLE_CACHE["names"]
+
+    db = connect_mysql()
+    if not db:
+        return _ROLE_CACHE["names"]
+
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT role_name FROM jd_roles")
+        names = []
+        for (role_name,) in cursor.fetchall():
+            if role_name:
+                names.append(role_name.strip())
+        cursor.close()
+        db.close()
+        if names:
+            _ROLE_CACHE["ts"] = now_ts
+            _ROLE_CACHE["names"] = names
+        return names
+    except Exception:
+        traceback.print_exc()
+        return _ROLE_CACHE["names"]
+
+
+def _match_role_name(role_text):
+    """Fuzzy-match a role name to existing jd_roles entries."""
+    if not role_text:
+        return None
+    cleaned = role_text.strip()
+    if not cleaned:
+        return None
+
+    options = _get_known_role_names()
+    if not options:
+        return cleaned
+
+    best = None
+    best_score = 0.0
+    for candidate in options:
+        score = SequenceMatcher(
+            None, cleaned.lower(), (candidate or "").lower()
+        ).ratio()
+        if score > best_score:
+            best = candidate
+            best_score = score
+
+    if best_score >= 0.72:
+        return best
+    return cleaned
+
+
+def _find_existing_candidate(
+    cursor, available_cols, first_name, last_name, email, phone, selected_role
+):
+    """Return existing user_data id if we already have the same person for the same role."""
+    required_cols = {"id", "first_name", "last_name", "email", "phone", "selected_role"}
+    if not required_cols.issubset(available_cols):
+        return None
+
+    first = (first_name or "").strip()
+    last = (last_name or "").strip()
+    mail = (email or "").strip()
+    phone_norm = (phone or "").strip()
+    role = (selected_role or "").strip()
+
+    if not (first and last and mail and phone_norm and role):
+        return None
+
+    lookup_sql = """
+        SELECT id
+        FROM user_data
+        WHERE first_name = %s
+          AND last_name = %s
+          AND email = %s
+          AND phone = %s
+          AND selected_role = %s
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """
+    cursor.execute(lookup_sql, (first, last, mail, phone_norm, role))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 def process_and_sync_resume(
     path,
     first_name="",
@@ -200,17 +220,10 @@ def process_and_sync_resume(
     phone="",
     selected_role=""
 ):
-    """Parse resume → insert into MySQL → sync to Elasticsearch."""
+    """Parse resume ? insert into MySQL."""
     global _SYN_CACHE
 
     resume_label = _build_resume_label(first_name, last_name, email, phone)
-
-
-    import os, json, mysql.connector
-    from urllib.parse import urlparse
-    from elasticsearch import Elasticsearch
-    from App.resume_parser.parser import ResumeParser
-    from App.config import DB_CONFIG, ES_CONFIG
 
     # 1️⃣ Parse the resume
     skills_path = os.path.join(BASE_DIR, "resume_parser", "data", "hard_skills.txt")
@@ -243,6 +256,13 @@ def process_and_sync_resume(
     parser = ResumeParser(path, skills_file=skills_path, synonym_map=variant_map)  # ✅ FIXED: use `path`, not `file_path`
     data = parser.get_extracted_data()
 
+    derived_role = selected_role or data.get("parsed_role")
+    canonical_role = _match_role_name(derived_role) if derived_role else None
+    if not canonical_role and data.get("parsed_role"):
+        canonical_role = _match_role_name(data.get("parsed_role"))
+
+    normalized_role = canonical_role or derived_role
+
     # 2️⃣ Build DB connection
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
@@ -268,7 +288,7 @@ def process_and_sync_resume(
         "email": email,
         "phone": phone,
         "address": data.get("address"),
-        "selected_role": selected_role,
+        "selected_role": normalized_role,
         "parsed_role": data.get("parsed_role"),
         "education_json": education_json,
         "experience_years": data.get("experience_years", 0),
@@ -306,12 +326,25 @@ def process_and_sync_resume(
             insert_fields.append(col)
             insert_values.append(val)
 
-    placeholders = ", ".join(["%s"] * len(insert_fields))
-    sql = f"INSERT INTO user_data ({', '.join(insert_fields)}) VALUES ({placeholders})"
+    assignment_parts = [f"{field} = %s" for field in insert_fields]
+    if "updated_at" in available_cols:
+        assignment_parts.append("updated_at = NOW()")
 
-    cursor.execute(sql, tuple(insert_values))
-    conn.commit()
-    candidate_id = cursor.lastrowid
+    existing_candidate_id = _find_existing_candidate(
+        cursor, available_cols, first_name, last_name, email, phone, normalized_role
+    )
+
+    if existing_candidate_id:
+        sql = f"UPDATE user_data SET {', '.join(assignment_parts)} WHERE id = %s"
+        cursor.execute(sql, tuple(insert_values + [existing_candidate_id]))
+        conn.commit()
+        candidate_id = existing_candidate_id
+    else:
+        placeholders = ", ".join(["%s"] * len(insert_fields))
+        sql = f"INSERT INTO user_data ({', '.join(insert_fields)}) VALUES ({placeholders})"
+        cursor.execute(sql, tuple(insert_values))
+        conn.commit()
+        candidate_id = cursor.lastrowid
 
     # Prepare ES document once (used for return even if ES is down)
     doc = {
@@ -322,7 +355,7 @@ def process_and_sync_resume(
         "address": data.get("address"),
         "city": data.get("city"),
         "country": data.get("country"),
-        "selected_role": selected_role,
+        "selected_role": normalized_role,
         "parsed_role": data.get("parsed_role"),
         "skills_hard": json.loads(skills_hard_canon),
         "skills_soft": json.loads(skills_soft_canon),
@@ -343,42 +376,11 @@ def process_and_sync_resume(
         "resume_display_name": resume_label,
     }
 
-    # 3️⃣ Sync to Elasticsearch
-    es = connect_es(auto_start=True)
-    if es:
-        try:
-            es.index(index=ES_CONFIG["index"], id=candidate_id, document=doc)
-        except Exception as exc:
-            print(f"[WARN] Elasticsearch sync skipped: {exc}")
-    else:
-        print("[WARN] Elasticsearch unavailable; skipping index.")
-
-    # 4️⃣ Cleanup
+    # Cleanup
     cursor.close()
     conn.close()
 
     return {"db_id": candidate_id, **doc}
-# ------------------------------------------------------
-# OPTIONAL SEARCH WRAPPER (for sidebar search)
-# ------------------------------------------------------
-def search_candidates_es(keyword):
-    """Search candidates in Elasticsearch by keyword."""
-    es = connect_es()
-    if not es:
-        return []
-
-    try:
-        query = {"query": {"multi_match": {"query": keyword, "fields": ["name", "skills", "degree", "city", "country"]}}}
-        results = es.search(index="candidates", body=query)
-        hits = [hit["_source"] for hit in results["hits"]["hits"]]
-        print(f"[ES SEARCH] Found {len(hits)} matches for '{keyword}'.")
-        return hits
-    except Exception as e:
-        print("[ES SEARCH ERROR]", e)
-        traceback.print_exc()
-        return []
-
-
 def _build_applications_filters(
     status=None,
     role=None,
@@ -707,6 +709,39 @@ def delete_candidate(user_id):
         return False
 
 
+def delete_candidate_note(note_id):
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM user_feedback WHERE id = %s", (note_id,))
+        db.commit()
+        deleted = cursor.rowcount > 0
+        cursor.close()
+        db.close()
+        return deleted
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def delete_all_candidate_notes(user_id):
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM user_feedback WHERE user_id = %s", (user_id,))
+        db.commit()
+        cursor.close()
+        db.close()
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
 def fetch_roles():
     db = connect_mysql()
     if not db:
@@ -723,6 +758,28 @@ def fetch_roles():
     except Exception:
         traceback.print_exc()
         return []
+
+
+def create_role(role_name, jd_text=""):
+    db = connect_mysql()
+    if not db:
+        return None
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO jd_roles (role_name, jd_text) VALUES (%s, %s)",
+            (role_name.strip(), jd_text),
+        )
+        role_id = cursor.lastrowid
+        db.commit()
+        cursor.close()
+        db.close()
+        # refresh role cache so new role is available immediately
+        _ROLE_CACHE["ts"] = 0
+        return role_id
+    except Exception:
+        traceback.print_exc()
+        return None
 
 
 def fetch_role_detail(role_id):
@@ -905,109 +962,135 @@ def analytics_overview():
 
 
 def get_dashboard_insights(top_skills=5, top_roles=5, recent=5):
-    """Return overview metrics from Elasticsearch for the dashboard."""
-    es = connect_es()
-    if not es:
-        return {
-            "total_candidates": 0,
-            "avg_resume_score": 0,
-            "top_skills": [],
-            "top_roles": [],
-            "recent_uploads": [],
-        }
+    """Return overview metrics from MySQL for the dashboard."""
+    default_response = {
+        "total_candidates": 0,
+        "avg_resume_score": 0,
+        "top_skills": [],
+        "top_roles": [],
+        "recent_uploads": [],
+    }
 
-    try:
-        overview_body = {
-            "size": 0,
-            "aggs": {
-                "top_skills": {
-                    "terms": {
-                        "field": "skills_hard.keyword",
-                        "size": top_skills,
-                    }
-                },
-                "top_roles": {
-                    "terms": {
-                        "field": "selected_role.keyword",
-                        "size": top_roles,
-                    }
-                },
-                "avg_resume_score": {
-                    "avg": {"field": "resume_score"},
-                },
-            },
-        }
-        overview_resp = es.search(index=ES_CONFIG["index"], body=overview_body)
-        total_candidates = overview_resp.get("hits", {}).get("total", {}).get("value", 0)
-        avg_resume_score = overview_resp.get("aggregations", {}).get("avg_resume_score", {}).get("value") or 0
-        top_skills_buckets = overview_resp.get("aggregations", {}).get("top_skills", {}).get("buckets", [])
-        top_roles_buckets = overview_resp.get("aggregations", {}).get("top_roles", {}).get("buckets", [])
-        top_skills = [
-            {"skill": bucket["key"], "count": bucket["doc_count"]}
-            for bucket in top_skills_buckets
-        ]
-        top_roles = [
-            {"role": bucket["key"], "count": bucket["doc_count"]}
-            for bucket in top_roles_buckets
-        ]
-    except Exception as exc:
-        print("[DASHBOARD] Aggregation failed:", exc)
-        traceback.print_exc()
-        # Fall back to minimal overview, but still attempt to fetch recent uploads
-        total_candidates = 0
-        avg_resume_score = 0
-        top_skills = []
-        top_roles = []
+    db = connect_mysql()
+    if not db:
+        return default_response
 
-    recent_uploads = []
+    cursor = db.cursor(dictionary=True)
     try:
-        recent_resp = es.search(
-            index=ES_CONFIG["index"],
-            size=recent,
-            sort=[{"user_id": {"order": "desc"}}],
-            _source=[
-                "user_id",
-                "name",
-                "email",
-                "phone",
-                "selected_role",
-                "parsed_role",
-                "resume_score",
-                "jd_match_score",
-                "skills_hard",
-                "seniority_level",
-                "experience_years",
-            ],
+        cursor.execute("SELECT COUNT(*) AS total, AVG(resume_score) AS avg_score FROM user_data")
+        metrics = cursor.fetchone() or {}
+        total_candidates = metrics.get("total", 0) or 0
+        avg_resume_score = metrics.get("avg_score") or 0
+
+        cursor.execute(
+            """
+            SELECT selected_role AS role, COUNT(*) AS count
+            FROM user_data
+            WHERE selected_role IS NOT NULL AND selected_role <> ''
+            GROUP BY selected_role
+            ORDER BY count DESC
+            LIMIT %s
+            """,
+            (top_roles,),
         )
-        recent_uploads = [hit["_source"] for hit in recent_resp.get("hits", {}).get("hits", [])]
-    except Exception as exc:
-        print("[DASHBOARD] Recent uploads query failed:", exc)
-        traceback.print_exc()
+        top_roles_rows = cursor.fetchall()
+        formatted_top_roles = [
+            {"role": row.get("role"), "count": row.get("count", 0)}
+            for row in top_roles_rows
+            if row.get("role")
+        ]
 
-    if total_candidates == 0:
+        cursor.execute("SELECT skills_hard FROM user_data WHERE skills_hard IS NOT NULL")
+        skill_counter = Counter()
+        for row in cursor.fetchall():
+            raw = row.get("skills_hard")
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            try:
+                skills = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                continue
+            if isinstance(skills, str):
+                skills = [skills]
+            for skill in skills or []:
+                skill = (skill or "").strip()
+                if skill:
+                    skill_counter[skill] += 1
+        formatted_top_skills = [
+            {"skill": name, "count": count}
+            for name, count in skill_counter.most_common(top_skills)
+        ]
+
+        cursor.execute(
+            """
+            SELECT
+                id AS user_id,
+                CONCAT(IFNULL(first_name,''), ' ', IFNULL(last_name,'')) AS name,
+                email,
+                phone,
+                selected_role,
+                parsed_role,
+                resume_score,
+                jd_match_score,
+                skills_hard,
+                seniority_level,
+                experience_years
+            FROM user_data
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (recent,),
+        )
+        recent_rows = cursor.fetchall()
+        recent_uploads = []
+        for row in recent_rows:
+            raw_skills = row.get("skills_hard")
+            if isinstance(raw_skills, bytes):
+                raw_skills = raw_skills.decode("utf-8", errors="ignore")
+            try:
+                parsed_skills = json.loads(raw_skills) if raw_skills else []
+            except Exception:
+                parsed_skills = []
+            recent_uploads.append(
+                {
+                    "user_id": row.get("user_id"),
+                    "name": (row.get("name") or "").strip(),
+                    "email": row.get("email"),
+                    "phone": row.get("phone"),
+                    "selected_role": row.get("selected_role"),
+                    "parsed_role": row.get("parsed_role"),
+                    "resume_score": row.get("resume_score"),
+                    "jd_match_score": row.get("jd_match_score"),
+                    "skills_hard": parsed_skills,
+                    "seniority_level": row.get("seniority_level"),
+                    "experience_years": row.get("experience_years"),
+                }
+            )
+
+        return {
+            "total_candidates": total_candidates,
+            "avg_resume_score": round(avg_resume_score or 0, 2),
+            "top_skills": formatted_top_skills,
+            "top_roles": formatted_top_roles,
+            "recent_uploads": recent_uploads,
+        }
+    except Exception:
+        traceback.print_exc()
+        return default_response
+    finally:
         try:
-            total_candidates = es.count(index=ES_CONFIG["index"]).get("count", 0)
+            cursor.close()
         except Exception:
             pass
-
-    return {
-        "total_candidates": total_candidates,
-        "avg_resume_score": round(avg_resume_score, 2),
-        "top_skills": top_skills,
-        "top_roles": top_roles,
-        "recent_uploads": recent_uploads,
-    }
+        db.close()
 
 
 # ------------------------------------------------------
 # DEBUG / MANUAL RUN
 # ------------------------------------------------------
 if __name__ == "__main__":
-    # Example usage: Parse + Insert + Sync
+    # Example usage: Parse + Insert
     test_file = os.path.join(BASE_DIR, "Uploaded_Resumes", "MY_CV.pdf")
     process_and_sync_resume(test_file)
-
-    # Example search
-    results = search_candidates_es("python")
-    for r in results:
-        print(r)

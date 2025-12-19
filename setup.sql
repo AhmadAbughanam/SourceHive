@@ -5,6 +5,7 @@
 --           HR feedback, and role-based JD matching.
 --  Engine:  MySQL 8+ (InnoDB)
 -- ============================================================
+SET FOREIGN_KEY_CHECKS = 0;
 
 -- ------------------------------------------------------------
 -- Create database (idempotent)
@@ -45,6 +46,7 @@ VALUES ('admin', 'admin@resume-analyzer', SHA2('admin@resume-analyzer', 256), 'S
 -- ------------------------------------------------------------
 -- 🔧 Safe rebuild of user_data  (removes old duplicate indexes)
 -- ------------------------------------------------------------
+DROP TABLE IF EXISTS user_feedback;
 DROP TABLE IF EXISTS user_data;
 
 CREATE TABLE user_data (
@@ -191,3 +193,4 @@ LEFT JOIN user_feedback f ON u.id = f.user_id;
 -- JOB ROLE: AI Engineer
 -- Location: Amman | Level: Junior | Hybrid
 -- ============================================================
+SET FOREIGN_KEY_CHECKS = 1;

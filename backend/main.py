@@ -10,7 +10,6 @@ from pathlib import Path
 import traceback
 import json  # for pretty printing
 from datetime import datetime
-from uuid import uuid4
 from dotenv import load_dotenv
 
 
@@ -24,7 +23,6 @@ load_dotenv(BASE_DIR / "App" / ".env")
 
 from App.db_io import (
     process_and_sync_resume,
-    search_candidates_es,
     get_dashboard_insights,
     fetch_applications,
     export_applications_csv,
@@ -32,14 +30,16 @@ from App.db_io import (
     update_candidate_status,
     add_candidate_note,
     delete_candidate,
+    delete_candidate_note,
+    delete_all_candidate_notes,
     fetch_roles,
     fetch_role_detail,
     update_role_jd,
     upsert_role_keyword,
     delete_role_keyword,
     analytics_overview,
+    create_role,
 )
-from App.config import DB_CONFIG, ES_CONFIG
 from App.resume_parser.parser import ResumeParser
 
 # Initialize FastAPI app
@@ -82,6 +82,11 @@ class RoleJDPayload(BaseModel):
     jd_text: str = Field("", description="Job description text")
 
 
+class RoleCreatePayload(BaseModel):
+    role_name: str = Field(..., min_length=2, max_length=255)
+    jd_text: str = Field("", description="Job description text")
+
+
 class KeywordPayload(BaseModel):
     keyword: str
     importance: str = Field(default="preferred")
@@ -121,12 +126,17 @@ async def upload_resume(
         if not file.filename.lower().endswith((".pdf", ".docx")):
             raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or DOCX.")
 
-        # Save file with unique name to avoid collisions on re-uploads
-        unique_filename = f"{uuid4().hex}_{file.filename}"
-        file_path = UPLOAD_DIR / unique_filename
+        # Save file with human-readable label + extension; ensure uniqueness if same person uploads multiple times
+        resume_label = _build_resume_label(first_name, last_name, email, phone)
+        ext = Path(file.filename).suffix.lower() or ".pdf"
+        safe_name = f"{resume_label}{ext}"
+        file_path = UPLOAD_DIR / safe_name
+        suffix = 1
+        while file_path.exists():
+            file_path = UPLOAD_DIR / f"{resume_label}_{suffix}{ext}"
+            suffix += 1
         with open(file_path, "wb") as f:
             f.write(await file.read())
-        resume_label = _build_resume_label(first_name, last_name, email, phone)
         print(f"\nSaved file to: {file_path}\n")
 
         # ==========================
@@ -184,25 +194,6 @@ async def upload_resume(
 # ============================================================
 # SEARCH CANDIDATES
 # ============================================================
-@app.get("/api/candidates/search")
-async def search_candidates(keyword: str):
-    try:
-        results = search_candidates_es(keyword)
-        print(f"\n🔍 Search results for '{keyword}':")
-        print(json.dumps(results, indent=4, ensure_ascii=False))
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "count": len(results),
-                "results": results
-            }
-        )
-    except Exception:
-        print("❌ Error in /api/candidates/search:")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
 @app.get("/api/dashboard/overview")
 async def dashboard_overview():
     try:
@@ -350,9 +341,37 @@ async def remove_application(application_id: int):
     return {"success": True}
 
 
+@app.delete("/api/hr/applications/{application_id}/notes/{note_id}")
+async def remove_note(application_id: int, note_id: int):
+    success = delete_candidate_note(note_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Unable to delete note")
+    return {"success": True}
+
+
+@app.delete("/api/hr/applications/{application_id}/notes")
+async def remove_all_notes(application_id: int):
+    success = delete_all_candidate_notes(application_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Unable to delete notes")
+    return {"success": True}
+
+
 @app.get("/api/hr/roles")
 async def list_roles():
     return {"success": True, "roles": fetch_roles()}
+
+
+@app.post("/api/hr/roles", status_code=201)
+async def create_hr_role(payload: RoleCreatePayload):
+    role_name = payload.role_name.strip()
+    if not role_name:
+        raise HTTPException(status_code=400, detail="Role name required")
+    role_id = create_role(role_name, payload.jd_text)
+    if not role_id:
+        raise HTTPException(status_code=500, detail="Unable to create role")
+    detail = fetch_role_detail(role_id)
+    return {"success": True, "role": detail["role"] if detail else {"id": role_id, "role_name": role_name, "jd_text": payload.jd_text}}
 
 
 @app.get("/api/hr/roles/{role_id}")

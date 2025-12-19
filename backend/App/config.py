@@ -22,21 +22,6 @@ DB_CONFIG = {
 
 
 # ------------------------------------------------------
-# ELASTICSEARCH CONFIGURATION
-# ------------------------------------------------------
-ES_CONFIG = {
-    # For single-node, no-auth mode
-    "host": os.getenv("ES_HOST", "http://127.0.0.1:9200"),
-    "index": os.getenv("ES_INDEX", "candidates"),
-
-    # Optional settings (for future scaling)
-    "timeout": int(os.getenv("ES_TIMEOUT", 30)),
-    "max_retries": int(os.getenv("ES_MAX_RETRIES", 3)),
-    "retry_on_timeout": True,
-}
-
-
-# ------------------------------------------------------
 # RESUME SCORING RULES (used in scoring.py)
 # ------------------------------------------------------
 SCORING_RULES = {

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import mysql.connector
 from elasticsearch import Elasticsearch
 import subprocess
@@ -9,7 +10,8 @@ from functools import lru_cache
 import traceback
 import csv
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal
 
 # --- FIX PATH ISSUES (works both from App/ and project root)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -157,6 +159,39 @@ from App.resume_parser import utils as parser_utils
 _SYN_CACHE = {"ts": 0, "map": {}}
 
 
+def _serialize_value(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+    return value
+
+
+def _serialize_row(row):
+    if not row:
+        return row
+    return {key: _serialize_value(val) for key, val in row.items()}
+
+
+def _serialize_rows(rows):
+    return [_serialize_row(row) for row in rows or []]
+
+
+def _build_resume_label(first_name, last_name, email, phone):
+    parts = [
+        (first_name or "").strip(),
+        (last_name or "").strip(),
+        (email or "").strip(),
+        (phone or "").strip(),
+    ]
+    base = "_".join(filter(None, parts)) or "resume"
+    normalized = re.sub(r"[^\w]+", "_", base).strip("_")
+    return normalized or "resume"
+
+
 def process_and_sync_resume(
     path,
     first_name="",
@@ -167,6 +202,8 @@ def process_and_sync_resume(
 ):
     """Parse resume → insert into MySQL → sync to Elasticsearch."""
     global _SYN_CACHE
+
+    resume_label = _build_resume_label(first_name, last_name, email, phone)
 
 
     import os, json, mysql.connector
@@ -303,6 +340,7 @@ def process_and_sync_resume(
         "jd_match_score": data.get("jd_match_score", 0),
         "status": "new",
         "cv_filename": os.path.basename(path),
+        "resume_display_name": resume_label,
     }
 
     # 3️⃣ Sync to Elasticsearch
@@ -449,7 +487,7 @@ def fetch_applications(
             query,
             [*filter_params, page_size, offset],
         )
-        rows = cursor.fetchall()
+        rows = _serialize_rows(cursor.fetchall())
 
         cursor.execute(status_summary_query)
         status_summary = cursor.fetchall()
@@ -567,13 +605,22 @@ def fetch_candidate_detail(user_id):
         user["skills_soft_canonical"] = _decode_json(user.get("skills_soft_canonical"))
 
         cursor.execute(notes_query, (user_id,))
-        notes = cursor.fetchall()
+        notes = [_serialize_row(row) for row in cursor.fetchall()]
 
         cursor.execute(role_keywords_query, (user.get("selected_role"),))
-        keywords = cursor.fetchall()
+        keywords = _serialize_rows(cursor.fetchall())
 
         cursor.close()
         db.close()
+
+        user = _serialize_row(user)
+        resume_label = _build_resume_label(
+            user.get("first_name", ""),
+            user.get("last_name", ""),
+            user.get("email", ""),
+            user.get("phone", "")
+        )
+        user["resume_display_name"] = resume_label
 
         # compute JD keyword match
         candidate_tokens = {
@@ -643,6 +690,23 @@ def add_candidate_note(user_id, comment):
         return False
 
 
+def delete_candidate(user_id):
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM user_data WHERE id = %s", (user_id,))
+        db.commit()
+        deleted = cursor.rowcount > 0
+        cursor.close()
+        db.close()
+        return deleted
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
 def fetch_roles():
     db = connect_mysql()
     if not db:
@@ -652,7 +716,7 @@ def fetch_roles():
         cursor.execute(
             "SELECT id, role_name, jd_text, updated_at FROM jd_roles ORDER BY role_name ASC"
         )
-        rows = cursor.fetchall()
+        rows = _serialize_rows(cursor.fetchall())
         cursor.close()
         db.close()
         return rows
@@ -676,6 +740,7 @@ def fetch_role_detail(role_id):
             cursor.close()
             db.close()
             return None
+        role = _serialize_row(role)
 
         cursor.execute(
             """
@@ -686,7 +751,7 @@ def fetch_role_detail(role_id):
             """,
             (role_id,),
         )
-        keywords = cursor.fetchall()
+        keywords = _serialize_rows(cursor.fetchall())
         cursor.close()
         db.close()
         return {"role": role, "keywords": keywords}
@@ -778,7 +843,7 @@ def analytics_overview():
         cursor.execute(
             "SELECT status, COUNT(*) AS count FROM user_data GROUP BY status ORDER BY count DESC"
         )
-        status_breakdown = cursor.fetchall()
+        status_breakdown = _serialize_rows(cursor.fetchall())
 
         cursor.execute(
             """
@@ -789,7 +854,7 @@ def analytics_overview():
             ORDER BY DATE(created_at)
             """
         )
-        over_time = cursor.fetchall()
+        over_time = _serialize_rows(cursor.fetchall())
 
         cursor.execute(
             """
@@ -800,7 +865,7 @@ def analytics_overview():
             LIMIT 5
             """
         )
-        top_roles = cursor.fetchall()
+        top_roles = _serialize_rows(cursor.fetchall())
 
         cursor.execute(
             """
@@ -818,7 +883,7 @@ def analytics_overview():
             ORDER BY bucket DESC
             """
         )
-        match_distribution = cursor.fetchall()
+        match_distribution = _serialize_rows(cursor.fetchall())
 
         cursor.close()
         db.close()

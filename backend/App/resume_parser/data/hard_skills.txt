@@ -1,0 +1,204 @@
+python
+java
+c
+c++
+c#
+javascript
+typescript
+html
+css
+react
+next.js
+vue
+angular
+flutter
+dart
+swift
+kotlin
+php
+node.js
+express
+django
+flask
+fastapi
+rest api
+graphql
+sql
+mysql
+postgresql
+sqlite
+mongodb
+firebase
+nosql
+json
+xml
+linux
+bash
+shell
+git
+github
+gitlab
+docker
+kubernetes
+aws
+azure
+gcp
+cloud
+terraform
+ansible
+jenkins
+devops
+ci
+cd
+nginx
+apache
+load balancing
+system design
+networking
+firewalls
+vpn
+cybersecurity
+cryptography
+penetration testing
+vulnerability assessment
+metasploit
+nmap
+wireshark
+ids
+ips
+siem
+splunk
+elastic
+elasticsearch
+logstash
+kibana
+big data
+hadoop
+spark
+kafka
+airflow
+etl
+data pipeline
+data warehouse
+snowflake
+databricks
+redshift
+pandas
+numpy
+scikit-learn
+tensorflow
+pytorch
+keras
+transformers
+hugging face
+llm
+rag
+langchain
+mcp
+llamaindex
+openai
+gemini
+bert
+gpt
+stable diffusion
+opencv
+image processing
+computer vision
+object detection
+segmentation
+classification
+nlp
+natural language processing
+tokenization
+text generation
+embeddings
+clustering
+regression
+classification
+reinforcement learning
+machine learning
+deep learning
+ai
+mlops
+quantization
+model optimization
+feature engineering
+data visualization
+matplotlib
+seaborn
+plotly
+tableau
+power bi
+excel
+data cleaning
+data analysis
+data science
+statistics
+probability
+linear algebra
+calculus
+optimization
+research
+simulation
+control systems
+robotics
+ros
+embedded systems
+microcontrollers
+arduino
+raspberry pi
+sensor fusion
+autonomous systems
+cv2
+sqlalchemy
+pytest
+unit testing
+integration testing
+oop
+object oriented programming
+design patterns
+api design
+microservices
+architecture
+scrum
+agile
+jira
+confluence
+gitflow
+docker compose
+virtualization
+vmware
+hyper-v
+linux server
+windows server
+load testing
+performance tuning
+data security
+encryption
+tokenization
+authentication
+authorization
+oauth
+jwt
+ssl
+tls
+websockets
+web scraping
+selenium
+beautifulsoup
+requests
+asyncio
+multithreading
+multiprocessing
+ci/cd
+cloud functions
+lambda
+google colab
+notebooks
+data engineering
+ai engineering
+software development
+mobile development
+full stack development
+backend development
+frontend development

@@ -1,18 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional
 import os
 import sys
+import re
 from pathlib import Path
 import traceback
 import json  # for pretty printing
 from datetime import datetime
+from uuid import uuid4
+from dotenv import load_dotenv
+
+
 
 # Ensure the backend directory itself is on sys.path so `App` stays importable
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
+
+# Load environment variables from backend/App/.env so DB/ES configs pick them up
+load_dotenv(BASE_DIR / "App" / ".env")
 
 from App.db_io import (
     process_and_sync_resume,
@@ -23,6 +31,7 @@ from App.db_io import (
     fetch_candidate_detail,
     update_candidate_status,
     add_candidate_note,
+    delete_candidate,
     fetch_roles,
     fetch_role_detail,
     update_role_jd,
@@ -79,6 +88,15 @@ class KeywordPayload(BaseModel):
     weight: float = Field(default=1.0)
     keyword_id: Optional[int] = None
 
+
+def _build_resume_label(first_name: str, last_name: str, email: str, phone: str) -> str:
+    parts = [first_name.strip(), last_name.strip(), email.strip(), phone.strip()]
+    base = "_".join(filter(None, parts))
+    if not base:
+        base = "resume"
+    normalized = re.sub(r"[^\w]+", "_", base).strip("_")
+    return normalized or "resume"
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -92,22 +110,24 @@ async def health_check():
 @app.post("/api/resume/upload")
 async def upload_resume(
     file: UploadFile = File(...),
-    first_name: str = "",
-    last_name: str = "",
-    email: str = "",
-    phone: str = "",
-    selected_role: str = ""
+    first_name: str = Form(""),
+    last_name: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    selected_role: str = Form("")
 ):
     try:
         # Validate file type
         if not file.filename.lower().endswith((".pdf", ".docx")):
             raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or DOCX.")
 
-        # Save file
-        file_path = UPLOAD_DIR / file.filename
+        # Save file with unique name to avoid collisions on re-uploads
+        unique_filename = f"{uuid4().hex}_{file.filename}"
+        file_path = UPLOAD_DIR / unique_filename
         with open(file_path, "wb") as f:
             f.write(await file.read())
-        print(f"\n✅ Saved file to: {file_path}\n")
+        resume_label = _build_resume_label(first_name, last_name, email, phone)
+        print(f"\nSaved file to: {file_path}\n")
 
         # ==========================
         # Parse resume
@@ -137,6 +157,8 @@ async def upload_resume(
             )
             print("💾 DB/ES Result:")
             print(json.dumps(db_result, indent=4, ensure_ascii=False))
+            if isinstance(db_result, dict):
+                db_result.setdefault("resume_display_name", resume_label)
         except Exception:
             print("❌ Error syncing to DB/ES:")
             traceback.print_exc()
@@ -317,6 +339,14 @@ async def create_application_note(application_id: int, payload: NotePayload):
     success = add_candidate_note(application_id, payload.comment.strip())
     if not success:
         raise HTTPException(status_code=500, detail="Unable to add note")
+    return {"success": True}
+
+
+@app.delete("/api/hr/applications/{application_id}")
+async def remove_application(application_id: int):
+    success = delete_candidate(application_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Unable to delete candidate")
     return {"success": True}
 
 

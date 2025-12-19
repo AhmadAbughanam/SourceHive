@@ -1,1 +1,6 @@
 mysql-connector-python
+PyMuPDF
+PyPDF2
+pytesseract
+Pillow
+python-docx

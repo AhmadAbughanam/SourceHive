@@ -1,0 +1,164 @@
+.analytics-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.analytics-header h2 {
+  margin-bottom: 4px;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.metric-card {
+  border-radius: 16px;
+  border: 1px solid #e3e8f5;
+  padding: 18px;
+  background: #fff;
+}
+
+.metric-card p {
+  color: #6b7280;
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+}
+
+.metric-card h3 {
+  font-size: 2rem;
+  margin-bottom: 6px;
+}
+
+.metric-card small {
+  color: #9ca3af;
+}
+
+.analytics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+}
+
+.chart-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.chart-card.span-2 {
+  grid-column: span 2;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.pill-highlight {
+  padding: 6px 12px;
+  background: #eef2ff;
+  border-radius: 999px;
+  color: #4338ca;
+  font-weight: 600;
+}
+
+.chart-vertical {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chart-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.chart-row .label {
+  width: 120px;
+  text-transform: capitalize;
+  color: #4b5563;
+  font-weight: 600;
+}
+
+.bar {
+  flex: 1;
+  background: #edeff5;
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bar div {
+  height: 100%;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+}
+
+.value {
+  min-width: 36px;
+  text-align: right;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.line-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  min-height: 220px;
+}
+
+.line-point {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.line-value {
+  width: 16px;
+  background: #4f46e5;
+  border-radius: 12px 12px 0 0;
+}
+
+.chart-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.pill {
+  padding: 12px;
+  border-radius: 14px;
+  background: #f3f4f6;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pill strong {
+  font-size: 1rem;
+}
+
+.pill span {
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+@media (max-width: 900px) {
+  .chart-card.span-2 {
+    grid-column: span 1;
+  }
+
+  .chart-row .label {
+    width: 90px;
+  }
+}

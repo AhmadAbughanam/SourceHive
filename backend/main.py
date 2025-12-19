@@ -39,7 +39,9 @@ from App.db_io import (
     delete_role_keyword,
     analytics_overview,
     create_role,
+    set_role_visibility,
 )
+from App.document_processing import analyze_and_extract
 from App.resume_parser.parser import ResumeParser
 
 # Initialize FastAPI app
@@ -63,9 +65,17 @@ SKILLS_FILE = BASE_DIR / "App" / "resume_parser" / "data" / "hard_skills.txt"
 if not SKILLS_FILE.exists():
     raise FileNotFoundError(f"Skills file not found: {SKILLS_FILE}")
 
-# Ensure _SYN_CACHE exists globally
-if "_SYN_CACHE" not in globals():
-    _SYN_CACHE = {"ts": 0, "map": {}}
+ALLOWED_UPLOAD_EXTENSIONS = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".txt",
+    ".rtf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+)
 
 ALLOWED_STATUSES = {"new", "shortlisted", "interviewed", "hired", "rejected"}
 
@@ -85,6 +95,10 @@ class RoleJDPayload(BaseModel):
 class RoleCreatePayload(BaseModel):
     role_name: str = Field(..., min_length=2, max_length=255)
     jd_text: str = Field("", description="Job description text")
+
+
+class RoleVisibilityPayload(BaseModel):
+    is_open: bool = Field(default=True)
 
 
 class KeywordPayload(BaseModel):
@@ -123,8 +137,11 @@ async def upload_resume(
 ):
     try:
         # Validate file type
-        if not file.filename.lower().endswith((".pdf", ".docx")):
-            raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF or DOCX.")
+        if not file.filename.lower().endswith(ALLOWED_UPLOAD_EXTENSIONS):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported file type. Use PDF, DOC/DOCX, TXT/RTF, or common image formats (PNG/JPG/WEBP).",
+            )
 
         # Save file with human-readable label + extension; ensure uniqueness if same person uploads multiple times
         resume_label = _build_resume_label(first_name, last_name, email, phone)
@@ -142,37 +159,57 @@ async def upload_resume(
         # ==========================
         # Parse resume
         # ==========================
+        doc_payload = {}
         try:
-            parser = ResumeParser(resume=str(file_path), skills_file=str(SKILLS_FILE))
+            doc_payload = analyze_and_extract(str(file_path), original_name=file.filename)
+        except Exception:
+            print('[Doc] Unable to analyze document; falling back to legacy extraction.')
+            traceback.print_exc()
+            doc_payload = {}
+
+        try:
+            parser = ResumeParser(
+                resume=str(file_path),
+                skills_file=str(SKILLS_FILE),
+                extracted_text=doc_payload.get('text'),
+                document_meta=doc_payload,
+                original_filename=file.filename,
+            )
             parsed_resume = parser.get_extracted_data()
-            print("📝 Parsed Resume:")
+            print('[Parse] Parsed resume successfully.')
             print(json.dumps(parsed_resume, indent=4, ensure_ascii=False))
         except Exception:
-            print("❌ Error parsing resume:")
+            print('[Parse] Error parsing resume:')
             traceback.print_exc()
             parsed_resume = {}
-
         # ==========================
         # Process and sync to DB/ES
         # ==========================
         try:
-            global _SYN_CACHE
             db_result = process_and_sync_resume(
                 path=str(file_path),
                 first_name=first_name,
                 last_name=last_name,
                 email=email,
                 phone=phone,
-                selected_role=selected_role
+                selected_role=selected_role,
+                resume_text=doc_payload.get('text'),
+                doc_kind=doc_payload.get('doc_kind'),
+                extraction_method=doc_payload.get('extraction_method'),
+                ocr_used=doc_payload.get('ocr_used'),
+                extraction_error=doc_payload.get('extraction_error'),
+                file_mime=doc_payload.get('file_mime'),
+                original_filename=file.filename,
             )
-            print("💾 DB/ES Result:")
+            print("[DB] Stored resume metadata:")
             print(json.dumps(db_result, indent=4, ensure_ascii=False))
             if isinstance(db_result, dict):
-                db_result.setdefault("resume_display_name", resume_label)
+                db_result.setdefault('resume_display_name', resume_label)
         except Exception:
-            print("❌ Error syncing to DB/ES:")
+            print("[DB] Error syncing to database:")
             traceback.print_exc()
             db_result = {}
+
 
         return JSONResponse(
             status_code=200,
@@ -180,6 +217,7 @@ async def upload_resume(
                 "success": True,
                 "message": "Resume processed successfully",
                 "parsed_resume": parsed_resume,
+                "document_meta": doc_payload,
                 "db_result": db_result
             }
         )
@@ -388,6 +426,14 @@ async def patch_role_jd(role_id: int, payload: RoleJDPayload):
     if not success:
         raise HTTPException(status_code=500, detail="Unable to update JD")
     return {"success": True}
+
+
+@app.patch("/api/hr/roles/{role_id}/visibility")
+async def patch_role_visibility(role_id: int, payload: RoleVisibilityPayload):
+    success = set_role_visibility(role_id, payload.is_open)
+    if not success:
+        raise HTTPException(status_code=500, detail="Unable to update role visibility")
+    return {"success": True, "is_open": payload.is_open}
 
 
 @app.post("/api/hr/roles/{role_id}/keywords")

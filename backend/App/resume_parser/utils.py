@@ -12,14 +12,22 @@ try:
 except Exception:
     _embedder = None
 
+try:
+    from App.document_processing import analyze_and_extract as _analyze_and_extract
+except ModuleNotFoundError:
+    try:
+        from document_processing import analyze_and_extract as _analyze_and_extract
+    except ModuleNotFoundError:
+        _analyze_and_extract = None
+
 # Load SpaCy model once
 nlp = spacy.load("en_core_web_sm")
 
 # -----------------------------
 # TEXT EXTRACTION
 # -----------------------------
-def extract_text(resume_path):
-    """Extract text from PDF or text files."""
+def _basic_extract_text(resume_path):
+    """Legacy text extraction fallback when OCR helpers are unavailable."""
     ext = os.path.splitext(resume_path)[1].lower()
     text = ""
 
@@ -34,6 +42,37 @@ def extract_text(resume_path):
     else:
         raise ValueError(f"Unsupported file type: {ext}")
     return text.strip()
+
+
+def extract_text_with_metadata(resume_path, original_name=None):
+    """
+    Extract resume text along with parsing metadata.
+
+    Falls back to the simple extractor when OCR dependencies are missing.
+    """
+    if _analyze_and_extract:
+        try:
+            payload = _analyze_and_extract(resume_path, original_name=original_name)
+            return payload.get("text") or "", payload
+        except Exception:
+            pass
+
+    text = _basic_extract_text(resume_path)
+    return text, {
+        "doc_kind": "unknown",
+        "file_mime": None,
+        "ocr_used": False,
+        "extraction_method": "legacy",
+        "extraction_error": None,
+        "text_length": len(text),
+        "details": {},
+    }
+
+
+def extract_text(resume_path):
+    """Backward-compatible helper that only returns text."""
+    text, _ = extract_text_with_metadata(resume_path)
+    return text
 
 
 def clean_extracted_text(text):

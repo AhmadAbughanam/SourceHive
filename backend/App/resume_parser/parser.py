@@ -6,19 +6,37 @@ from . import utils
 
 
 class ResumeParser:
-    def __init__(self, resume, skills_file=None, custom_regex=None, synonym_map=None):
+    def __init__(
+        self,
+        resume,
+        skills_file=None,
+        custom_regex=None,
+        synonym_map=None,
+        *,
+        extracted_text=None,
+        document_meta=None,
+        original_filename=None,
+    ):
         self.resume_path = resume
         self.skills_file = skills_file
         self.custom_regex = custom_regex
         self.variant_map = synonym_map or {}
         self.variant_keys = list(self.variant_map.keys())
+        self.original_filename = original_filename
 
         # Load SpaCy model once
         self.nlp = spacy.load("en_core_web_sm")
         self.matcher = Matcher(self.nlp.vocab)
 
-        # Extract text
-        self.text_raw = utils.extract_text(self.resume_path)
+        # Extract text (OCR-aware if available)
+        if extracted_text is not None:
+            meta = document_meta or {}
+            text_source = extracted_text
+        else:
+            text_source, meta = utils.extract_text_with_metadata(self.resume_path, original_name=original_filename)
+
+        self.doc_metadata = meta or {}
+        self.text_raw = text_source or ""
         self.text = utils.clean_extracted_text(self.text_raw)
         self.nlp_doc = self.nlp(self.text)
 
@@ -43,6 +61,11 @@ class ResumeParser:
             "titles": [],
             "seniority_level": "",
             "resume_embedding": None,
+            "doc_kind": self.doc_metadata.get("doc_kind"),
+            "extraction_method": self.doc_metadata.get("extraction_method"),
+            "ocr_used": self.doc_metadata.get("ocr_used"),
+            "extraction_error": self.doc_metadata.get("extraction_error"),
+            "document_metadata": self.doc_metadata,
         }
 
         # Run parser

@@ -14,6 +14,16 @@ from decimal import Decimal
 from collections import Counter
 from difflib import SequenceMatcher
 
+try:
+    from App.document_processing import analyze_and_extract
+except ModuleNotFoundError:
+    from document_processing import analyze_and_extract
+
+try:
+    from App.ats_pipeline import compute_weighted_jd_match
+except ModuleNotFoundError:
+    from ats_pipeline import compute_weighted_jd_match
+
 # --- FIX PATH ISSUES (works both from App/ and project root)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(BASE_DIR)
@@ -86,9 +96,23 @@ def insert_resume_to_db(parsed_data):
 # ------------------------------------------------------
 
 # synonym cache to reduce DB hits
-_SYN_CACHE = {"ts": 0, "map": {}}
+_SYN_CACHE = {"ts": 0, "variant_map": {}, "variant_keys": [], "category_map": {}}
 # role cache for fuzzy matching
 _ROLE_CACHE = {"ts": 0, "names": []}
+_ROLE_KEYWORD_CACHE = {"ts": 0, "roles": {}}
+
+
+def _ensure_role_visibility_column(cursor):
+    """Ensure jd_roles has is_open column, add if missing."""
+    try:
+        cursor.execute("SHOW COLUMNS FROM jd_roles LIKE 'is_open'")
+        exists = cursor.fetchone()
+        if not exists:
+            cursor.execute(
+                "ALTER TABLE jd_roles ADD COLUMN is_open TINYINT(1) NOT NULL DEFAULT 1 AFTER jd_text"
+            )
+    except Exception:
+        traceback.print_exc()
 
 
 def _serialize_value(value):
@@ -179,6 +203,83 @@ def _match_role_name(role_text):
     return cleaned
 
 
+def _get_role_keywords(role_name):
+    """Fetch JD keywords for a role with basic caching."""
+    if not role_name:
+        return []
+    role_key = role_name.strip().lower()
+    cache_entry = _ROLE_KEYWORD_CACHE["roles"].get(role_key)
+    now_ts = time.time()
+    if cache_entry and now_ts - cache_entry["ts"] < 300:
+        return cache_entry["keywords"]
+
+    db = connect_mysql()
+    if not db:
+        return []
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT jk.keyword, jk.importance, jk.weight
+            FROM jd_keywords jk
+            JOIN jd_roles jr ON jk.role_id = jr.id
+            WHERE jr.role_name = %s
+            ORDER BY jk.importance DESC, jk.keyword ASC
+            """,
+            (role_name,),
+        )
+        keywords = cursor.fetchall()
+        cursor.close()
+        db.close()
+    except Exception:
+        traceback.print_exc()
+        keywords = []
+
+    _ROLE_KEYWORD_CACHE["roles"][role_key] = {"ts": now_ts, "keywords": keywords}
+    return keywords
+
+
+def _get_synonym_maps():
+    """Return variant map, variant keys, and category map with caching."""
+    global _SYN_CACHE
+    now_ts = time.time()
+    cached = _SYN_CACHE
+    if cached["variant_map"] and now_ts - cached["ts"] < 300:
+        return cached["variant_map"], cached["variant_keys"], cached["category_map"]
+
+    variant_map = {}
+    category_map = {}
+    try:
+        db_tmp = mysql.connector.connect(**DB_CONFIG)
+        cur_tmp = db_tmp.cursor(dictionary=True)
+        cur_tmp.execute("SELECT token, expands_to, category FROM synonyms;")
+        syn_rows = cur_tmp.fetchall()
+        cur_tmp.close()
+        db_tmp.close()
+    except Exception:
+        syn_rows = []
+
+    for row in syn_rows:
+        token = parser_utils.normalize_skill_token(row.get("token"))
+        expands_to = parser_utils.normalize_skill_token(row.get("expands_to") or token)
+        if not token:
+            continue
+        canonical = expands_to or token
+        category = (row.get("category") or "skill").strip().lower()
+        variant_map[token] = canonical
+        category_map[token] = category
+        category_map.setdefault(canonical, category)
+        variant_map.setdefault(canonical, canonical)
+    variant_keys = list(variant_map.keys())
+    _SYN_CACHE = {
+        "ts": now_ts,
+        "variant_map": variant_map,
+        "variant_keys": variant_keys,
+        "category_map": category_map,
+    }
+    return variant_map, variant_keys, category_map
+
+
 def _find_existing_candidate(
     cursor, available_cols, first_name, last_name, email, phone, selected_role
 ):
@@ -218,56 +319,83 @@ def process_and_sync_resume(
     last_name="",
     email="",
     phone="",
-    selected_role=""
+    selected_role="",
+    *,
+    existing_id=None,
+    preserve_status=None,
+    resume_text=None,
+    notes=None,
+    doc_kind=None,
+    extraction_method=None,
+    ocr_used=None,
+    extraction_error=None,
+    file_mime=None,
+    original_filename=None,
+    force_status=None,
 ):
-    """Parse resume ? insert into MySQL."""
-    global _SYN_CACHE
-
+    """Parse resume & insert into MySQL."""
     resume_label = _build_resume_label(first_name, last_name, email, phone)
-
-    # 1️⃣ Parse the resume
     skills_path = os.path.join(BASE_DIR, "resume_parser", "data", "hard_skills.txt")
-    # Build synonym variant map from DB (canonicalization) with cache (5 min TTL)
-    now_ts = time.time()
-    if now_ts - _SYN_CACHE["ts"] > 300 or not _SYN_CACHE["map"]:
+    variant_map, variant_keys, category_map = _get_synonym_maps()
+
+    extraction_payload = None
+    text_override = (resume_text or "").strip()
+    if not text_override:
         try:
-            db_tmp = mysql.connector.connect(**DB_CONFIG)
-            cur_tmp = db_tmp.cursor(dictionary=True)
-            cur_tmp.execute("SELECT token, expands_to FROM synonyms;")
-            syn_rows = cur_tmp.fetchall()
-            cur_tmp.close()
-            db_tmp.close()
+            extraction_payload = analyze_and_extract(
+                path,
+                original_name=original_filename,
+            )
+            text_override = extraction_payload.get("text") or ""
         except Exception:
-            syn_rows = []
+            extraction_payload = None
+    if not text_override:
+        text_override = parser_utils.extract_text(path)
 
-        variant_map = {}
-        for row in syn_rows:
-            token = parser_utils.normalize_skill_token(row.get("token"))
-            canonical = parser_utils.normalize_skill_token(row.get("expands_to") or token)
-            if token:
-                variant_map[token] = canonical or token
-            if canonical:
-                variant_map.setdefault(canonical, canonical)
+    document_meta = extraction_payload or {
+        "doc_kind": doc_kind,
+        "extraction_method": extraction_method,
+        "ocr_used": ocr_used,
+        "extraction_error": extraction_error,
+        "file_mime": file_mime,
+        "details": {},
+    }
 
-        _SYN_CACHE = {"ts": now_ts, "map": variant_map}
-    else:
-        variant_map = _SYN_CACHE["map"]
-
-    parser = ResumeParser(path, skills_file=skills_path, synonym_map=variant_map)  # ✅ FIXED: use `path`, not `file_path`
+    parser = ResumeParser(
+        path,
+        skills_file=skills_path,
+        synonym_map=variant_map,
+        extracted_text=text_override,
+        document_meta=document_meta,
+        original_filename=original_filename,
+    )
     data = parser.get_extracted_data()
 
     derived_role = selected_role or data.get("parsed_role")
     canonical_role = _match_role_name(derived_role) if derived_role else None
     if not canonical_role and data.get("parsed_role"):
         canonical_role = _match_role_name(data.get("parsed_role"))
-
     normalized_role = canonical_role or derived_role
 
-    # 2️⃣ Build DB connection
+    role_keywords = _get_role_keywords(normalized_role)
+    match_info = None
+    if role_keywords:
+        resume_tokens = (data.get("skills_hard_canonical") or []) + (data.get("skills_soft_canonical") or [])
+        match_info = compute_weighted_jd_match(
+            resume_tokens,
+            role_keywords,
+            variant_map=variant_map,
+            variant_keys=variant_keys,
+            category_map=category_map,
+        )
+
+    status_value = force_status or preserve_status or "new"
+
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor()
+    cursor.execute("SHOW COLUMNS FROM user_data;")
+    available_cols = {row[0] for row in cursor.fetchall()}
 
-    # Prepare JSON fields safely (raw + canonical)
     skills_hard_raw = json.dumps(data.get("skills_hard_raw") or data.get("skills_hard") or data.get("skills") or [])
     skills_soft_raw = json.dumps(data.get("skills_soft_raw") or data.get("skills_soft") or [])
     skills_hard_canon = json.dumps(data.get("skills_hard_canonical") or data.get("skills_hard") or data.get("skills") or [])
@@ -277,10 +405,6 @@ def process_and_sync_resume(
     titles_json = json.dumps(data.get("titles") or [])
     sentences_json = json.dumps(data.get("sentences") or [])
     embedding_json = json.dumps(data.get("resume_embedding")) if data.get("resume_embedding") is not None else None
-
-    # Build dynamic column list to stay backward-compatible
-    cursor.execute("SHOW COLUMNS FROM user_data;")
-    available_cols = {row[0] for row in cursor.fetchall()}
 
     base_fields = {
         "first_name": first_name,
@@ -292,11 +416,11 @@ def process_and_sync_resume(
         "parsed_role": data.get("parsed_role"),
         "education_json": education_json,
         "experience_years": data.get("experience_years", 0),
-        "skills_hard": skills_hard_canon,  # store canonical as primary
+        "skills_hard": skills_hard_canon,
         "skills_soft": skills_soft_canon,
         "resume_score": data.get("resume_score", 0),
-        "jd_match_score": data.get("jd_match_score", 0),
-        "status": "new",
+        "jd_match_score": (match_info or {}).get("score", data.get("jd_match_score", 0)),
+        "status": status_value,
         "cv_filename": os.path.basename(path),
     }
 
@@ -311,16 +435,15 @@ def process_and_sync_resume(
         "certifications_json": certifications_json,
         "job_titles_json": titles_json,
         "seniority_level": data.get("seniority_level"),
+        "notes": notes,
     }
 
     insert_fields = []
     insert_values = []
-
     for col, val in base_fields.items():
         if col in available_cols:
             insert_fields.append(col)
             insert_values.append(val)
-
     for col, val in optional_fields.items():
         if col in available_cols:
             insert_fields.append(col)
@@ -330,7 +453,7 @@ def process_and_sync_resume(
     if "updated_at" in available_cols:
         assignment_parts.append("updated_at = NOW()")
 
-    existing_candidate_id = _find_existing_candidate(
+    existing_candidate_id = existing_id or _find_existing_candidate(
         cursor, available_cols, first_name, last_name, email, phone, normalized_role
     )
 
@@ -346,7 +469,6 @@ def process_and_sync_resume(
         conn.commit()
         candidate_id = cursor.lastrowid
 
-    # Prepare ES document once (used for return even if ES is down)
     doc = {
         "user_id": candidate_id,
         "name": f"{first_name} {last_name}".strip(),
@@ -370,17 +492,18 @@ def process_and_sync_resume(
         "sentences": data.get("sentences"),
         "resume_embedding": data.get("resume_embedding"),
         "resume_score": data.get("resume_score", 0),
-        "jd_match_score": data.get("jd_match_score", 0),
-        "status": "new",
+        "jd_match_score": (match_info or {}).get("score", data.get("jd_match_score", 0)),
+        "status": status_value,
         "cv_filename": os.path.basename(path),
         "resume_display_name": resume_label,
+        "doc_metadata": document_meta,
+        "jd_match_details": match_info,
     }
 
-    # Cleanup
     cursor.close()
     conn.close()
-
     return {"db_id": candidate_id, **doc}
+
 def _build_applications_filters(
     status=None,
     role=None,
@@ -574,13 +697,6 @@ def fetch_candidate_detail(user_id):
         ORDER BY updated_at DESC
     """
 
-    role_keywords_query = """
-        SELECT jk.keyword, jk.importance, jk.weight
-        FROM jd_keywords jk
-        JOIN jd_roles jr ON jk.role_id = jr.id
-        WHERE jr.role_name = %s
-    """
-
     try:
         cursor = db.cursor(dictionary=True)
         cursor.execute(query, (user_id,))
@@ -609,9 +725,6 @@ def fetch_candidate_detail(user_id):
         cursor.execute(notes_query, (user_id,))
         notes = [_serialize_row(row) for row in cursor.fetchall()]
 
-        cursor.execute(role_keywords_query, (user.get("selected_role"),))
-        keywords = _serialize_rows(cursor.fetchall())
-
         cursor.close()
         db.close()
 
@@ -624,30 +737,25 @@ def fetch_candidate_detail(user_id):
         )
         user["resume_display_name"] = resume_label
 
-        # compute JD keyword match
-        candidate_tokens = {
-            token.lower()
-            for token in user["skills_hard"]
-            + user["skills_soft"]
-            + user["skills_hard_canonical"]
-            + user["skills_soft_canonical"]
-        }
-        matched = []
-        missing = []
-        for kw in keywords:
-            key = (kw["keyword"] or "").lower()
-            if not key:
-                continue
-            if any(key in token for token in candidate_tokens):
-                matched.append(kw["keyword"])
-            else:
-                missing.append(kw["keyword"])
+        keywords = _serialize_rows(_get_role_keywords(user.get("selected_role")))
+        variant_map, variant_keys, category_map = _get_synonym_maps()
+        resume_tokens = (
+            (user["skills_hard_canonical"] or user["skills_hard"])
+            + (user["skills_soft_canonical"] or user["skills_soft"])
+        )
+        match_details = compute_weighted_jd_match(
+            resume_tokens,
+            keywords,
+            variant_map=variant_map,
+            variant_keys=variant_keys,
+            category_map=category_map,
+        )
 
         return {
             "user": user,
             "notes": notes,
             "jd_keywords": keywords,
-            "jd_match": {"matched": matched, "missing": missing},
+            "jd_match": match_details or {"matched": [], "missing": [], "score": 0, "total": 0},
         }
     except Exception:
         traceback.print_exc()
@@ -748,10 +856,18 @@ def fetch_roles():
         return []
     try:
         cursor = db.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT id, role_name, jd_text, updated_at FROM jd_roles ORDER BY role_name ASC"
-        )
-        rows = _serialize_rows(cursor.fetchall())
+        try:
+            cursor.execute(
+                "SELECT id, role_name, jd_text, is_open, updated_at FROM jd_roles ORDER BY role_name ASC"
+            )
+            rows = _serialize_rows(cursor.fetchall())
+        except mysql.connector.Error:
+            cursor.execute(
+                "SELECT id, role_name, jd_text, updated_at FROM jd_roles ORDER BY role_name ASC"
+            )
+            rows = _serialize_rows(cursor.fetchall())
+            for row in rows:
+                row["is_open"] = 1
         cursor.close()
         db.close()
         return rows
@@ -766,10 +882,19 @@ def create_role(role_name, jd_text=""):
         return None
     try:
         cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO jd_roles (role_name, jd_text) VALUES (%s, %s)",
-            (role_name.strip(), jd_text),
-        )
+        trimmed_name = (role_name or "").strip()
+        if not trimmed_name:
+            return None
+        try:
+            cursor.execute(
+                "INSERT INTO jd_roles (role_name, jd_text, is_open) VALUES (%s, %s, %s)",
+                (trimmed_name, jd_text, 1),
+            )
+        except mysql.connector.Error:
+            cursor.execute(
+                "INSERT INTO jd_roles (role_name, jd_text) VALUES (%s, %s)",
+                (trimmed_name, jd_text),
+            )
         role_id = cursor.lastrowid
         db.commit()
         cursor.close()
@@ -788,11 +913,20 @@ def fetch_role_detail(role_id):
         return None
     try:
         cursor = db.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT id, role_name, jd_text, updated_at FROM jd_roles WHERE id = %s",
-            (role_id,),
-        )
-        role = cursor.fetchone()
+        try:
+            cursor.execute(
+                "SELECT id, role_name, jd_text, is_open, updated_at FROM jd_roles WHERE id = %s",
+                (role_id,),
+            )
+        except mysql.connector.Error:
+            cursor.execute(
+                "SELECT id, role_name, jd_text, updated_at FROM jd_roles WHERE id = %s",
+                (role_id,),
+            )
+        row = cursor.fetchone()
+        if row and "is_open" not in row:
+            row["is_open"] = 1
+        role = row
         if not role:
             cursor.close()
             db.close()
@@ -871,6 +1005,27 @@ def upsert_role_keyword(role_id, keyword, importance="preferred", weight=1.0, ke
 def delete_role_keyword(keyword_id):
     db = connect_mysql()
     if not db:
+        return False
+
+
+def set_role_visibility(role_id, is_open=True):
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        _ensure_role_visibility_column(cursor)
+        cursor.execute(
+            "UPDATE jd_roles SET is_open=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+            (1 if is_open else 0, role_id),
+        )
+        db.commit()
+        cursor.close()
+        db.close()
+        _ROLE_CACHE["ts"] = 0
+        return True
+    except Exception:
+        traceback.print_exc()
         return False
     try:
         cursor = db.cursor()
@@ -979,8 +1134,8 @@ def get_dashboard_insights(top_skills=5, top_roles=5, recent=5):
     try:
         cursor.execute("SELECT COUNT(*) AS total, AVG(resume_score) AS avg_score FROM user_data")
         metrics = cursor.fetchone() or {}
-        total_candidates = metrics.get("total", 0) or 0
-        avg_resume_score = metrics.get("avg_score") or 0
+        total_candidates = int(metrics.get("total", 0) or 0)
+        avg_resume_score = float(metrics.get("avg_score") or 0)
 
         cursor.execute(
             """
@@ -994,11 +1149,17 @@ def get_dashboard_insights(top_skills=5, top_roles=5, recent=5):
             (top_roles,),
         )
         top_roles_rows = cursor.fetchall()
-        formatted_top_roles = [
-            {"role": row.get("role"), "count": row.get("count", 0)}
-            for row in top_roles_rows
-            if row.get("role")
-        ]
+        formatted_top_roles = []
+        for row in top_roles_rows or []:
+            role_name = row.get("role")
+            if not role_name:
+                continue
+            count_val = row.get("count", 0) or 0
+            if isinstance(count_val, Decimal):
+                count_val = float(count_val)
+            if isinstance(count_val, float) and count_val.is_integer():
+                count_val = int(count_val)
+            formatted_top_roles.append({"role": role_name, "count": count_val})
 
         cursor.execute("SELECT skills_hard FROM user_data WHERE skills_hard IS NOT NULL")
         skill_counter = Counter()
@@ -1061,11 +1222,11 @@ def get_dashboard_insights(top_skills=5, top_roles=5, recent=5):
                     "phone": row.get("phone"),
                     "selected_role": row.get("selected_role"),
                     "parsed_role": row.get("parsed_role"),
-                    "resume_score": row.get("resume_score"),
-                    "jd_match_score": row.get("jd_match_score"),
+                      "resume_score": float(row.get("resume_score") or 0),
+                      "jd_match_score": float(row.get("jd_match_score") or 0),
                     "skills_hard": parsed_skills,
                     "seniority_level": row.get("seniority_level"),
-                    "experience_years": row.get("experience_years"),
+                      "experience_years": float(row.get("experience_years") or 0),
                 }
             )
 

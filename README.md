@@ -1,16 +1,18 @@
+# SourceHive - Resume Parsing & Matching System
 
-# AI Resume Analyzer & Interview Screening System
+## Updated Architecture (FastAPI + React)
 
-An HR-driven system for **resume parsing, role-based scoring, and AI-assisted interview screening**.  
-The system evaluates candidates objectively using **job templates defined by HR**, then validates shortlisted candidates through a **standardized AI quiz per job level**.
-
-This platform provides **structured, explainable insights** to support hiring decisions — it does **not** automate hiring.
+- **Backend**: FastAPI (Python) - `/backend/main.py`
+- **Frontend**: React - `/frontend/`
+- **Database**: MySQL
+- **Search Engine**: MySQL-backed filters (Elasticsearch removed for prototype)
 
 ---
 
 ## 1. Purpose
 
 The system helps HR teams to:
+
 - Parse resumes accurately across formats
 - Score candidates based on job-specific requirements
 - Rank and shortlist candidates objectively
@@ -27,7 +29,6 @@ The system helps HR teams to:
 - Quizzes are standardized per job level
 - No autonomous hiring decisions
 
-
 ---
 
 ## 3. Phase 0 — Job Template Setup (HR)
@@ -35,6 +36,7 @@ The system helps HR teams to:
 Before candidates upload CVs, HR defines a **Job Template** that controls all evaluation logic.
 
 ### Job Template Includes
+
 - Job title
 - Job level: `Junior | Mid | Senior`
 - Required resume sections
@@ -49,7 +51,7 @@ Before candidates upload CVs, HR defines a **Job Template** that controls all ev
   - Location match
   - Experience threshold
 
-> HR defines *what matters*.  
+> HR defines _what matters_.  
 > The system only evaluates.
 
 ---
@@ -57,12 +59,15 @@ Before candidates upload CVs, HR defines a **Job Template** that controls all ev
 ## 4. Phase 1 — CV Upload & Parsing
 
 ### 4.1 Upload
+
 Applicants upload:
+
 - PDF (text-based or scanned)
 - Image (JPG / PNG)
 - DOCX (optional)
 
 System actions:
+
 - MIME + extension validation
 - Secure file storage
 - File hashing to detect duplicates
@@ -74,12 +79,14 @@ System actions:
 The system uses a layout-aware parsing approach.
 
 #### Parsing Steps
+
 1. Document type detection
 2. OCR for scanned/image CVs
 3. Layout detection (sections, columns, headings)
 4. Structured data extraction
 
 #### Extracted Information
+
 - Contact information
 - Education history
 - Work experience (roles, companies, dates)
@@ -96,11 +103,14 @@ All extracted data is stored as a **canonical candidate profile**.
 ## 5. Phase 2 — Resume Scoring
 
 ### 5.1 Resume Structure Score
+
 Evaluates CV completeness and formatting:
+
 - Required sections present
 - Missing critical sections
 
 Outputs:
+
 - Structure score (0–100)
 - Missing section hints
 
@@ -111,6 +121,7 @@ Outputs:
 Each CV is evaluated against the selected Job Template.
 
 #### Scoring Signals
+
 - Skill coverage (critical > preferred)
 - Years of experience alignment
 - Education fit
@@ -119,6 +130,7 @@ Each CV is evaluated against the selected Job Template.
 Scoring is **rule-based and deterministic**.
 
 #### Example Output
+
 ```json
 {
   "skill_match_score": 75,
@@ -249,7 +261,3 @@ Final:      75
 - **Database:** MySQL
 - **UI:** Streamlit
 - **API Layer:** FastAPI
-
-
-
-

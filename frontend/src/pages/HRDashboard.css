@@ -1,0 +1,275 @@
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.dashboard-header h2 {
+  margin-bottom: 4px;
+}
+
+.metric-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 18px;
+}
+
+.metric-card {
+  padding: 18px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #eef0f4;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.metric-label {
+  color: #697386;
+  font-size: 0.85rem;
+  margin-bottom: 4px;
+}
+
+.metric-card h3 {
+  font-size: 2rem;
+  margin-bottom: 6px;
+}
+
+.metric-helper {
+  color: #7e8a9a;
+  font-size: 0.85rem;
+}
+
+.filter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.filter-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.filter-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.85rem;
+  color: #4c5767;
+  gap: 6px;
+}
+
+.filter-grid input,
+.filter-grid select {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #d0d5dd;
+}
+
+.filter-grid .full-width {
+  grid-column: 1 / -1;
+}
+
+.applications-table {
+  background: #fff;
+  border: 1px solid #eef0f4;
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.status-badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.applications-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.applications-table th,
+.applications-table td {
+  text-align: left;
+  padding: 10px 8px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.applications-table th {
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.05em;
+  color: #76839b;
+}
+
+.candidate-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.candidate-cell strong {
+  font-size: 1rem;
+}
+
+.candidate-cell span {
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+.date-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+
+.date-cell strong {
+  color: #111827;
+}
+
+.notes-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 30px;
+  border-radius: 8px;
+  background: #ecfdf5;
+  color: #047857;
+  font-weight: 600;
+}
+
+.primary-btn.small {
+  font-size: 0.85rem;
+  padding: 6px 12px;
+  text-decoration: none;
+  text-align: center;
+}
+
+.action-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.danger-btn {
+  border: 1px solid #fca5a5;
+  color: #b91c1c;
+  background: #fff5f5;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.danger-btn.small {
+  font-size: 0.85rem;
+  padding: 6px 12px;
+}
+
+.table-empty {
+  padding: 20px;
+  color: #666;
+  font-style: italic;
+}
+
+.table-error {
+  color: #b42318;
+  background: #fee4e2;
+  padding: 10px;
+  border-radius: 8px;
+}
+
+.table-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.table-pagination button {
+  border: 1px solid #d0d5dd;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.status-pill {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  text-transform: capitalize;
+}
+
+.status-new {
+  background: #f0f4ff;
+  color: #2f3f8f;
+}
+
+.status-shortlisted {
+  background: #e0fbea;
+  color: #0f8a4b;
+}
+
+.status-interviewed {
+  background: #fff4e6;
+  color: #b55700;
+}
+
+.status-hired {
+  background: #e7f5ff;
+  color: #0b79d0;
+}
+
+.status-rejected {
+  background: #fdecef;
+  color: #c62828;
+}
+
+.link-btn {
+  color: #4f46e5;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+@media (max-width: 768px) {
+  .dashboard-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .table-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}

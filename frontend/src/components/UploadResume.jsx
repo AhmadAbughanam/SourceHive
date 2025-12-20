@@ -17,6 +17,7 @@ export default function UploadResume() {
   const [result, setResult] = useState(null)
   const [roles, setRoles] = useState([])
 
+  // Load saved form data from localStorage
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')
@@ -30,6 +31,7 @@ export default function UploadResume() {
     }
   }, [])
 
+  // Save form data to localStorage
   useEffect(() => {
     const payload = {
       firstName,
@@ -41,6 +43,7 @@ export default function UploadResume() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
   }, [firstName, lastName, email, phone, selectedRole])
 
+  // Fetch available roles
   useEffect(() => {
     getRoles()
       .then((res) => {
@@ -56,17 +59,19 @@ export default function UploadResume() {
 
   const handleFileChange = (e) => {
     setFile(e.target.files[0])
+    setError('')
+    setSuccess(false)
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     
     if (!file) {
-      setError('Please select a file')
+      setError('Please select a resume file to upload')
       return
     }
     if (!selectedRole) {
-      setError('Please select a role')
+      setError('Please select a role to apply for')
       return
     }
 
@@ -89,91 +94,106 @@ export default function UploadResume() {
         setSuccess(true)
         setResult(response.data.data)
         setFile(null)
+        // Reset file input
+        const fileInput = document.querySelector('input[type="file"]')
+        if (fileInput) fileInput.value = ''
       }
     } catch (err) {
-      setError(err.response?.data?.detail || 'Upload failed')
+      setError(err.response?.data?.detail || 'Upload failed. Please try again.')
     } finally {
       setLoading(false)
     }
   }
 
+  const openRoles = roles.filter((role) => role.is_open !== 0 && role.is_open !== false)
+
   return (
     <div className="upload-container">
       <h2>Upload Resume</h2>
+
+      {openRoles.length === 0 && (
+        <div className="upload-info">
+          No open roles are currently available. Please contact HR or check back later.
+        </div>
+      )}
       
-      <form onSubmit={handleSubmit}>
-        <div className="form-group">
-          <label>First Name</label>
-          <input
-            type="text"
-            value={firstName}
-            onChange={(e) => setFirstName(e.target.value)}
-            placeholder="John"
-          />
+      <form onSubmit={handleSubmit} className="upload-form-card">
+        <div className="form-row">
+          <div className="form-group">
+            <label>First Name</label>
+            <input
+              type="text"
+              value={firstName}
+              onChange={(e) => setFirstName(e.target.value)}
+              placeholder="John"
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Last Name</label>
+            <input
+              type="text"
+              value={lastName}
+              onChange={(e) => setLastName(e.target.value)}
+              placeholder="Doe"
+            />
+          </div>
         </div>
 
-        <div className="form-group">
-          <label>Last Name</label>
-          <input
-            type="text"
-            value={lastName}
-            onChange={(e) => setLastName(e.target.value)}
-            placeholder="Doe"
-          />
+        <div className="form-row">
+          <div className="form-group">
+            <label>Email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="john.doe@example.com"
+            />
+          </div>
+
+          <div className="form-group">
+            <label>Phone</label>
+            <input
+              type="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="+1 (555) 123-4567"
+            />
+          </div>
         </div>
 
-        <div className="form-group">
-          <label>Email</label>
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="john@example.com"
-          />
-        </div>
-
-        <div className="form-group">
-          <label>Phone</label>
-          <input
-            type="tel"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-            placeholder="+1234567890"
-          />
-        </div>
-
-        <div className="form-group">
+        <div className="form-group required">
           <label>Role</label>
           <select
             value={selectedRole}
             onChange={(e) => setSelectedRole(e.target.value)}
-            disabled={roles.filter((role) => role.is_open !== 0 && role.is_open !== false).length === 0}
+            disabled={openRoles.length === 0}
+            required
           >
-            {roles.filter((role) => role.is_open !== 0 && role.is_open !== false).length === 0 && (
+            {openRoles.length === 0 && (
               <option value="">No open roles available</option>
             )}
-            {roles
-              .filter((role) => role.is_open !== 0 && role.is_open !== false)
-              .map((role) => (
-                <option key={role.id} value={role.role_name}>
-                  {role.role_name}
-                </option>
-              ))}
+            {openRoles.map((role) => (
+              <option key={role.id} value={role.role_name}>
+                {role.role_name}
+              </option>
+            ))}
           </select>
         </div>
 
-        <div className="form-group">
-          <label>Resume File (PDF)</label>
+        <div className="form-group required">
+          <label>Resume File</label>
           <input
             type="file"
             accept=".pdf,.doc,.docx"
             onChange={handleFileChange}
+            required
           />
-          {file && <p className="file-name">Selected: {file.name}</p>}
+          {file && <p className="file-name">{file.name}</p>}
         </div>
 
-        <button type="submit" disabled={loading}>
-          {loading ? 'Processing...' : 'Upload & Process'}
+        <button type="submit" disabled={loading || openRoles.length === 0}>
+          {loading ? 'Processing Resume...' : 'Upload & Process Resume'}
         </button>
       </form>
 
@@ -183,7 +203,7 @@ export default function UploadResume() {
         <div className="success-message">
           <p>✅ Resume processed successfully!</p>
           <div className="result-summary">
-            <h3>Parsed Information:</h3>
+            <h3>Parsed Information</h3>
             <pre>{JSON.stringify(result, null, 2)}</pre>
           </div>
         </div>

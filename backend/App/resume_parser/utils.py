@@ -5,6 +5,8 @@ from PyPDF2 import PdfReader
 import spacy
 from difflib import SequenceMatcher
 from typing import Dict, Iterable, Set, Tuple, List
+from functools import lru_cache
+from spacy.matcher import PhraseMatcher
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -20,8 +22,9 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         _analyze_and_extract = None
 
-# Load SpaCy model once
-nlp = spacy.load("en_core_web_sm")
+@lru_cache(maxsize=1)
+def get_nlp():
+    return spacy.load("en_core_web_sm")
 
 # -----------------------------
 # TEXT EXTRACTION
@@ -109,28 +112,53 @@ def extract_mobile_number(text, custom_regex=None):
     return phone
 
 
-import json
-import os
-import re
-
 def extract_skills(doc, skills_file=None):
-    """Return dict of hard/soft skills found (raw tokens)."""
-    hard_skills_path = os.path.join(os.path.dirname(skills_file), "hard_skills.txt")
-    soft_skills_path = os.path.join(os.path.dirname(skills_file), "soft_skills.txt")
+    """
+    Return dict of hard/soft skills found (raw tokens).
 
-    hard_skills = set(open(hard_skills_path).read().lower().splitlines())
-    soft_skills = set(open(soft_skills_path).read().lower().splitlines())
+    Uses PhraseMatcher so multi-word skills like "machine learning" are detected.
+    """
+    base_dir = os.path.dirname(skills_file) if skills_file else os.path.join(os.path.dirname(__file__), "data")
+    hard_skills_path = os.path.join(base_dir, "hard_skills.txt")
+    soft_skills_path = os.path.join(base_dir, "soft_skills.txt")
 
-    found = {"hard": [], "soft": []}
-    tokens = [t.text.lower() for t in doc if not t.is_stop and len(t.text) > 1]
+    hard_skills = []
+    soft_skills = []
+    if os.path.exists(hard_skills_path):
+        with open(hard_skills_path, "r", encoding="utf-8", errors="ignore") as fh:
+            hard_skills = [line.strip() for line in fh.read().splitlines() if line.strip()]
+    if os.path.exists(soft_skills_path):
+        with open(soft_skills_path, "r", encoding="utf-8", errors="ignore") as fh:
+            soft_skills = [line.strip() for line in fh.read().splitlines() if line.strip()]
 
-    for token in tokens:
-        if token in hard_skills:
-            found["hard"].append(token)
-        elif token in soft_skills:
-            found["soft"].append(token)
+    found_hard: Set[str] = set()
+    found_soft: Set[str] = set()
 
-    return found
+    matcher_hard = PhraseMatcher(doc.vocab, attr="LOWER")
+    matcher_soft = PhraseMatcher(doc.vocab, attr="LOWER")
+    nlp = get_nlp()
+
+    hard_patterns = [nlp.make_doc(skill) for skill in hard_skills]
+    soft_patterns = [nlp.make_doc(skill) for skill in soft_skills]
+    if hard_patterns:
+        matcher_hard.add("HARD", hard_patterns)
+    if soft_patterns:
+        matcher_soft.add("SOFT", soft_patterns)
+
+    for _match_id, start, end in matcher_hard(doc):
+        token = normalize_skill_token(doc[start:end].text)
+        if token:
+            found_hard.add(token)
+
+    for _match_id, start, end in matcher_soft(doc):
+        token = normalize_skill_token(doc[start:end].text)
+        if token and token not in found_hard:
+            found_soft.add(token)
+
+    return {
+        "hard": sorted(found_hard),
+        "soft": sorted(found_soft),
+    }
 
 # -----------------------------
 # SKILL NORMALIZATION
@@ -305,7 +333,7 @@ def extract_experience_info(text):
                 pass
 
     # NLP-based fallback (for organization detection)
-    doc = nlp(text)
+    doc = get_nlp()(text)
     for ent in doc.ents:
         if ent.label_ == "ORG" and ent.text not in experience_info["companies"]:
             experience_info["companies"].append(ent.text)
@@ -351,7 +379,7 @@ def detect_seniority_level(text: str) -> str:
 def split_sentences(text: str) -> List[str]:
     if not text:
         return []
-    doc = nlp(text)
+    doc = get_nlp()(text)
     return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
 
 

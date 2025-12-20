@@ -44,6 +44,10 @@ export const updateApplicationStatus = (id, status) => {
   return api.patch(`/hr/applications/${id}/status`, { status })
 }
 
+export const updateApplicationResumeScore = (id, resume_score) => {
+  return api.patch(`/hr/applications/${id}/resume_score`, { resume_score })
+}
+
 export const addCandidateNote = (id, comment) => {
   return api.post(`/hr/applications/${id}/notes`, { comment })
 }
@@ -59,6 +63,30 @@ export const deleteNote = (applicationId, noteId) => {
 export const deleteAllNotes = (applicationId) => {
   return api.delete(`/hr/applications/${applicationId}/notes`)
 }
+
+export const reprocessCandidate = (id) => {
+  return api.post(`/hr/candidates/${id}/reprocess`)
+}
+
+export const getSkillDictionary = (kind = 'hard') => {
+  return api.get('/hr/skills/dictionary', { params: { kind } })
+}
+
+export const addSkillsToDictionary = (payload) => {
+  return api.post('/hr/skills/dictionary', payload)
+}
+
+export const getSkillSuggestions = (params = {}) => {
+  return api.get('/hr/skills/enrichment', { params })
+}
+
+export const listSynonyms = () => api.get('/hr/synonyms')
+
+export const createSynonymApi = (payload) => api.post('/hr/synonyms', payload)
+
+export const updateSynonymApi = (id, payload) => api.patch(`/hr/synonyms/${id}`, payload)
+
+export const deleteSynonymApi = (id) => api.delete(`/hr/synonyms/${id}`)
 
 export const getRoles = () => api.get('/hr/roles')
 
@@ -77,4 +105,34 @@ export const saveRoleKeyword = (roleId, payload) =>
 export const deleteRoleKeyword = (keywordId) =>
   api.delete(`/hr/roles/keywords/${keywordId}`)
 
-export const getAnalytics = () => api.get('/hr/analytics')
+export const getAnalytics = (params = {}) => api.get('/hr/analytics', { params })
+
+export const getInterviewSessions = () => api.get('/hr/interviews/sessions')
+
+export const inviteAIInterview = (payload) => api.post('/hr/interviews/invite', payload)
+
+export const bulkInviteAIInterviews = (payload) => api.post('/hr/interviews/bulk-invite', payload)
+
+export const getInterviewPortal = (sessionId) => api.get(`/interviews/${sessionId}`)
+
+export const startInterviewPortal = (sessionId) => api.post(`/interviews/${sessionId}/start`)
+
+export const completeInterviewPortal = (sessionId, payload = {}) =>
+  api.post(`/interviews/${sessionId}/complete`, payload)
+
+export const inviteInterviewEmail = (payload) => api.post('/interviews/invite', payload)
+
+export const getInterviewPortalByToken = (token) => api.get('/interviews/by-token', { params: { token } })
+
+export const startInterviewByToken = (token) => api.post('/interviews/by-token/start', null, { params: { token } })
+
+export const completeInterviewByToken = (token, payload = {}) =>
+  api.post('/interviews/by-token/complete', payload, { params: { token } })
+
+export const sendHrEmail = (payload) => api.post('/hr/email/send', payload)
+
+export const startInterviewByTokenWithBot = (token) =>
+  api.post('/interviews/by-token/start', null, { params: { token } })
+
+export const sendInterviewMessage = (token, payload) =>
+  api.post('/interviews/by-token/message', payload, { params: { token } })

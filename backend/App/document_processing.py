@@ -296,6 +296,31 @@ def analyze_and_extract(
     }
 
 
+def run_cv_understanding(
+    file_path: str,
+    *,
+    original_name: Optional[str] = None,
+    file_bytes: Optional[bytes] = None,
+) -> Dict[str, object]:
+    """
+    Backwards-compatible helper that mirrors the Streamlit prototype.
+
+    Args:
+        file_path: absolute or relative path to the saved document.
+        original_name: original filename from the upload (optional).
+        file_bytes: optional byte buffer (used to avoid re-reading headers).
+
+    Returns:
+        Same payload as analyze_and_extract (doc_kind, text, metadata, etc.).
+    """
+    header = file_bytes[:8192] if file_bytes else None
+    return analyze_and_extract(
+        file_path,
+        original_name=original_name,
+        header_bytes=header,
+    )
+
+
 def redact_preview_text(text: str, limit: int = 500) -> str:
     """Return a redacted preview of the extracted text for UI consumption."""
     if not text:
@@ -306,4 +331,3 @@ def redact_preview_text(text: str, limit: int = 500) -> str:
     if len(redacted) > limit:
         snippet += "..."
     return snippet
-

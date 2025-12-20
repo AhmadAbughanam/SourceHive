@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+
+# Virtual environments
+venv/
+backend/venv/
+.venv/
+
+# Environment files / secrets
+backend/App/.env
+.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Uploads / generated files
+backend/App/Uploaded_Resumes/
+
+# Local LLM models
+backend/model/
+
+# OS
+.DS_Store
+Thumbs.db

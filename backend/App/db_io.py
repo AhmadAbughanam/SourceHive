@@ -9,10 +9,11 @@ from functools import lru_cache
 import traceback
 import csv
 from io import StringIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from collections import Counter
 from difflib import SequenceMatcher
+from uuid import uuid4
 
 try:
     from App.document_processing import analyze_and_extract
@@ -91,6 +92,23 @@ def insert_resume_to_db(parsed_data):
         return False
 
 
+def _skills_data_dir():
+    return os.path.join(BASE_DIR, "resume_parser", "data")
+
+
+def _skills_file(kind: str):
+    filename = "hard_skills.txt" if (kind or "").lower() == "hard" else "soft_skills.txt"
+    return os.path.join(_skills_data_dir(), filename)
+
+
+def _load_skill_set(kind: str):
+    path = _skills_file(kind)
+    if not os.path.exists(path):
+        return set()
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        return {parser_utils.normalize_skill_token(line) for line in fh.read().splitlines() if line.strip()}
+
+
 # ------------------------------------------------------
 # FULL PIPELINE: PARSE DB PIPELINE
 # ------------------------------------------------------
@@ -100,6 +118,14 @@ _SYN_CACHE = {"ts": 0, "variant_map": {}, "variant_keys": [], "category_map": {}
 # role cache for fuzzy matching
 _ROLE_CACHE = {"ts": 0, "names": []}
 _ROLE_KEYWORD_CACHE = {"ts": 0, "roles": {}}
+
+STOPWORDS_SKILL_DISCOVERY = {
+    "and", "or", "the", "a", "an", "to", "of", "in", "for", "on", "with", "as", "by", "at", "from",
+    "this", "that", "these", "those", "are", "is", "was", "were", "be", "been", "being",
+    "i", "we", "you", "they", "he", "she", "it", "my", "our", "your", "their",
+    "responsible", "responsibilities", "duties", "summary", "profile", "experience", "skills",
+    "knowledge", "ability", "strong", "good", "excellent", "working", "years", "year", "months", "month",
+}
 
 
 def _ensure_role_visibility_column(cursor):
@@ -114,6 +140,246 @@ def _ensure_role_visibility_column(cursor):
     except Exception:
         traceback.print_exc()
 
+
+def ensure_interview_schema_mod():
+    """Ensure interview_sessions table exists (idempotent)."""
+    db = connect_mysql()
+    if not db:
+        return False
+
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS interview_sessions (
+              session_id        VARCHAR(64) PRIMARY KEY,
+              user_id           BIGINT NOT NULL,
+              candidate_name    VARCHAR(255),
+              email             VARCHAR(190),
+              invite_email      VARCHAR(190),
+              interview_role    VARCHAR(120),
+              interview_status  ENUM('invited','in_progress','completed','expired','canceled') DEFAULT 'invited',
+              interview_score   DECIMAL(5,2) DEFAULT 0.0,
+              token_hash        CHAR(64),
+              invite_last_error TEXT,
+              current_question  TEXT,
+              llm_messages_json MEDIUMTEXT,
+              question_count    INT NOT NULL DEFAULT 0,
+              invite_sent_at    TIMESTAMP NULL,
+              expires_at        TIMESTAMP NULL,
+              started_at        TIMESTAMP NULL,
+              completed_at      TIMESTAMP NULL,
+              created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (user_id) REFERENCES user_data(id) ON DELETE CASCADE,
+              INDEX idx_is_user (user_id),
+              INDEX idx_is_status (interview_status),
+              INDEX idx_is_role (interview_role),
+              INDEX idx_is_created (created_at),
+              UNIQUE KEY uk_is_token_hash (token_hash)
+            ) ENGINE=InnoDB
+            """,
+        )
+
+        # Idempotent upgrades for existing DBs (columns + indexes).
+        cursor.execute("SHOW COLUMNS FROM interview_sessions LIKE 'token_hash'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE interview_sessions ADD COLUMN token_hash CHAR(64) NULL AFTER interview_score")
+        cursor.execute("SHOW COLUMNS FROM interview_sessions LIKE 'invite_last_error'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE interview_sessions ADD COLUMN invite_last_error TEXT NULL AFTER token_hash")
+        cursor.execute("SHOW COLUMNS FROM interview_sessions LIKE 'current_question'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE interview_sessions ADD COLUMN current_question TEXT NULL AFTER invite_last_error")
+        cursor.execute("SHOW COLUMNS FROM interview_sessions LIKE 'llm_messages_json'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE interview_sessions ADD COLUMN llm_messages_json MEDIUMTEXT NULL AFTER current_question")
+        cursor.execute("SHOW COLUMNS FROM interview_sessions LIKE 'question_count'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE interview_sessions ADD COLUMN question_count INT NOT NULL DEFAULT 0 AFTER llm_messages_json")
+        cursor.execute("SHOW INDEX FROM interview_sessions WHERE Key_name = 'uk_is_token_hash'")
+        if not cursor.fetchone():
+            cursor.execute("CREATE UNIQUE INDEX uk_is_token_hash ON interview_sessions (token_hash)")
+
+        db.commit()
+        cursor.close()
+        db.close()
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def fetch_interview_sessions():
+    ensure_interview_schema_mod()
+    db = connect_mysql()
+    if not db:
+        return []
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT
+              session_id,
+              user_id,
+              candidate_name,
+              email,
+              invite_email,
+              interview_role,
+              interview_status,
+              interview_score,
+              invite_sent_at,
+              expires_at,
+              started_at,
+              completed_at,
+              created_at
+            FROM interview_sessions
+            ORDER BY created_at DESC
+            """
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        db.close()
+        return _serialize_rows(rows)
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
+def create_interview_invite(user_id, candidate_name, role_name, email="", expires_in_hours=72):
+    ensure_interview_schema_mod()
+    if not user_id or not role_name:
+        return None
+
+    db = connect_mysql()
+    if not db:
+        return None
+
+    now = datetime.utcnow()
+    try:
+        expires = now + timedelta(hours=int(expires_in_hours or 72))
+    except Exception:
+        expires = now + timedelta(hours=72)
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT session_id
+            FROM interview_sessions
+            WHERE user_id = %s
+              AND interview_role = %s
+              AND interview_status IN ('invited','in_progress')
+              AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP())
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (int(user_id), role_name),
+        )
+        existing = cursor.fetchone()
+        if existing and existing.get("session_id"):
+            cursor.close()
+            db.close()
+            return {"session_id": existing["session_id"], "created": False}
+
+        session_id = uuid4().hex
+        cursor.execute(
+            """
+            INSERT INTO interview_sessions
+            (session_id, user_id, candidate_name, email, invite_email, interview_role,
+             interview_status, interview_score, invite_sent_at, expires_at, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,'invited',0.0,%s,%s,%s)
+            """,
+            (
+                session_id,
+                int(user_id),
+                (candidate_name or "").strip() or None,
+                (email or "").strip() or None,
+                (email or "").strip() or None,
+                (role_name or "").strip(),
+                now,
+                expires,
+                now,
+            ),
+        )
+        db.commit()
+        cursor.close()
+        db.close()
+        return {"session_id": session_id, "created": True}
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def bulk_invite_best_fits(role_name, top_n=10, min_jd=70, expires_in_hours=72):
+    ensure_interview_schema_mod()
+    if not role_name:
+        return {"created": 0, "skipped": 0, "errors": 0, "session_ids": []}
+
+    db = connect_mysql()
+    if not db:
+        return {"created": 0, "skipped": 0, "errors": 0, "session_ids": []}
+
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT
+              id,
+              first_name,
+              last_name,
+              email,
+              jd_match_score,
+              resume_score
+            FROM user_data
+            WHERE selected_role = %s
+            ORDER BY jd_match_score DESC, resume_score DESC, created_at DESC
+            LIMIT %s
+            """,
+            (role_name, int(top_n) * 3),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        db.close()
+    except Exception:
+        traceback.print_exc()
+        return {"created": 0, "skipped": 0, "errors": 0, "session_ids": []}
+
+    created = 0
+    skipped = 0
+    errors = 0
+    session_ids = []
+
+    for row in rows or []:
+        try:
+            jd_score = float(row.get("jd_match_score") or 0)
+        except Exception:
+            jd_score = 0.0
+        if jd_score < float(min_jd or 0):
+            continue
+
+        candidate_name = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip() or None
+        email = row.get("email") or ""
+        result = create_interview_invite(
+            user_id=row.get("id"),
+            candidate_name=candidate_name,
+            role_name=role_name,
+            email=email,
+            expires_in_hours=expires_in_hours,
+        )
+        if not result:
+            errors += 1
+            continue
+        if result.get("created"):
+            created += 1
+        else:
+            skipped += 1
+        if result.get("session_id"):
+            session_ids.append(result["session_id"])
+        if created >= int(top_n):
+            break
+
+    return {"created": created, "skipped": skipped, "errors": errors, "session_ids": session_ids}
 
 def _serialize_value(value):
     if isinstance(value, (datetime, date)):
@@ -146,6 +412,25 @@ def _build_resume_label(first_name, last_name, email, phone):
     base = "_".join(filter(None, parts)) or "resume"
     normalized = re.sub(r"[^\w]+", "_", base).strip("_")
     return normalized or "resume"
+
+
+def _append_skills_to_file(kind: str, skills):
+    kind = (kind or "hard").lower()
+    path = _skills_file(kind)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    existing = _load_skill_set(kind)
+    normalized = []
+    for skill in skills or []:
+        norm = parser_utils.normalize_skill_token(skill)
+        if norm and norm not in existing:
+            existing.add(norm)
+            normalized.append(norm)
+    if not normalized:
+        return 0
+    with open(path, "a", encoding="utf-8") as fh:
+        for token in normalized:
+            fh.write(token + "\n")
+    return len(normalized)
 
 
 def _get_known_role_names():
@@ -235,8 +520,287 @@ def _get_role_keywords(role_name):
         traceback.print_exc()
         keywords = []
 
+    # Fallback: if HR didn't define keywords yet, derive them from jd_text using
+    # known skills + synonyms so JD match can still work for prototypes.
+    if not keywords:
+        try:
+            jd_text = _get_role_jd_text(role_name)
+            variant_map, _, _ = _get_synonym_maps()
+            keywords = _derive_keywords_from_jd_text(jd_text, variant_map=variant_map, max_keywords=40)
+        except Exception:
+            keywords = []
+
     _ROLE_KEYWORD_CACHE["roles"][role_key] = {"ts": now_ts, "keywords": keywords}
     return keywords
+
+
+def _derive_keywords_from_jd_text(jd_text: str, *, variant_map=None, max_keywords: int = 40):
+    variant_map = variant_map or {}
+    jd_norm = parser_utils.normalize_skill_token(jd_text or "")
+    if not jd_norm:
+        return []
+
+    known = set()
+    try:
+        known |= _load_skill_set("hard")
+        known |= _load_skill_set("soft")
+    except Exception:
+        pass
+    try:
+        known |= set(variant_map.keys())
+        known |= set(variant_map.values())
+    except Exception:
+        pass
+
+    padded = f" {jd_norm} "
+    keywords = []
+    # Prefer multi-word phrases first for better signal.
+    for token in sorted(known, key=lambda s: (s.count(" "), len(s)), reverse=True):
+        token = (token or "").strip()
+        if len(token) < 3:
+            continue
+        if len(keywords) >= max_keywords:
+            break
+        # Whitespace-bounded match to reduce accidental substrings.
+        if re.search(rf"(^|\\s){re.escape(token)}(\\s|$)", padded):
+            keywords.append({"keyword": token, "importance": "preferred", "weight": 1.0})
+    return keywords
+
+
+def _fetch_recent_resume_texts(role=None, limit=400):
+    db = connect_mysql()
+    if not db:
+        return []
+    try:
+        cursor = db.cursor()
+        if role:
+            cursor.execute(
+                """
+                SELECT full_text_clean
+                FROM user_data
+                WHERE selected_role = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (role, int(limit)),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT full_text_clean
+                FROM user_data
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+        rows = cursor.fetchall()
+        cursor.close()
+        db.close()
+        texts = []
+        for (text,) in rows:
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            texts.append(text or "")
+        return texts
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
+def _get_role_jd_text(role_name):
+    if not role_name:
+        return ""
+    db = connect_mysql()
+    if not db:
+        return ""
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT jd_text FROM jd_roles WHERE role_name = %s LIMIT 1", (role_name,))
+        row = cursor.fetchone()
+        cursor.close()
+        db.close()
+        if row and row[0]:
+            text = row[0]
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            return text or ""
+        return ""
+    except Exception:
+        return ""
+
+
+def discover_skill_candidates(role=None, limit=400, max_phrases=200):
+    texts = _fetch_recent_resume_texts(role, limit)
+    if not texts:
+        return []
+
+    known_hard = _load_skill_set("hard")
+    known_soft = _load_skill_set("soft")
+    known_skills = known_hard.union(known_soft)
+    jd_text = _get_role_jd_text(role)
+    jd_norm = parser_utils.normalize_skill_token(jd_text) if jd_text else ""
+
+    doc_freq = {}
+    examples = {}
+    jd_hits = set()
+
+    for raw in texts:
+        text_norm = parser_utils.normalize_skill_token(raw or "")
+        if not text_norm:
+            continue
+
+        tokens = re.findall(r"[A-Za-z0-9\\+#\\.\\-/]+", text_norm)
+        tokens = [t for t in tokens if len(t) > 1 and t not in STOPWORDS_SKILL_DISCOVERY]
+
+        candidates = set()
+        for token in tokens:
+            if any(ch in token for ch in "+#./-") or any(ch.isdigit() for ch in token) or len(token) <= 6:
+                candidates.add(token)
+
+        for n in (2, 3, 4):
+            for idx in range(0, max(0, len(tokens) - n + 1)):
+                gram = " ".join(tokens[idx:idx + n]).strip()
+                if len(gram) < 6:
+                    continue
+                candidates.add(gram)
+
+        for cand in candidates:
+            if cand in known_skills:
+                continue
+            if len(cand) < 2:
+                continue
+            doc_freq[cand] = doc_freq.get(cand, 0) + 1
+            if cand not in examples:
+                snippet = (raw or "")[:160].replace("\n", " ").strip()
+                examples[cand] = snippet
+            if jd_norm and f" {cand} " in f" {jd_norm} ":
+                jd_hits.add(cand)
+
+    rows = []
+    for cand, freq in doc_freq.items():
+        has_digits = any(ch.isdigit() for ch in cand)
+        has_symbols = any(ch in cand for ch in "+#./-")
+        score = freq * 10 + (15 if cand in jd_hits else 0) + (5 if has_digits else 0) + (5 if has_symbols else 0)
+        rows.append(
+            {
+                "skill": cand,
+                "docs": freq,
+                "in_jd": cand in jd_hits,
+                "score": score,
+                "example": examples.get(cand, ""),
+            }
+        )
+
+    rows.sort(key=lambda item: (item["score"], item["docs"], item["skill"]), reverse=True)
+    return rows[: int(max_phrases)]
+
+
+def append_skills_to_dictionary(kind, skills):
+    added = _append_skills_to_file(kind, skills)
+    return {"added": added, "kind": (kind or "hard").lower()}
+
+
+def get_skill_dictionary(kind):
+    kind = (kind or "hard").lower()
+    entries = sorted(_load_skill_set(kind))
+    return {"kind": kind, "skills": entries}
+
+
+def list_synonyms():
+    db = connect_mysql()
+    if not db:
+        return []
+    try:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT id, token, expands_to, category FROM synonyms ORDER BY token ASC")
+        rows = cursor.fetchall()
+        cursor.close()
+        db.close()
+        return _serialize_rows(rows)
+    except Exception:
+        traceback.print_exc()
+        return []
+
+
+def create_synonym(token, expands_to, category="skill"):
+    if not token or not expands_to:
+        raise ValueError("token and expands_to are required")
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO synonyms (token, expands_to, category)
+            VALUES (%s, %s, %s)
+            """,
+            (token.strip(), expands_to.strip(), (category or "skill").strip().lower()),
+        )
+        db.commit()
+        cursor.close()
+        db.close()
+        _clear_synonym_cache()
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def update_synonym(synonym_id, token=None, expands_to=None, category=None):
+    if not synonym_id:
+        raise ValueError("synonym_id is required")
+    fields = []
+    values = []
+    if token is not None:
+        fields.append("token = %s")
+        values.append(token.strip())
+    if expands_to is not None:
+        fields.append("expands_to = %s")
+        values.append(expands_to.strip())
+    if category is not None:
+        fields.append("category = %s")
+        values.append((category or "skill").strip().lower())
+    if not fields:
+        return False
+
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        sql = f"UPDATE synonyms SET {', '.join(fields)} WHERE id = %s"
+        cursor.execute(sql, values + [int(synonym_id)])
+        db.commit()
+        cursor.close()
+        db.close()
+        _clear_synonym_cache()
+        return cursor.rowcount > 0
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def delete_synonym(synonym_id):
+    if not synonym_id:
+        return False
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM synonyms WHERE id = %s", (int(synonym_id),))
+        db.commit()
+        deleted = cursor.rowcount > 0
+        cursor.close()
+        db.close()
+        if deleted:
+            _clear_synonym_cache()
+        return deleted
+    except Exception:
+        traceback.print_exc()
+        return False
 
 
 def _get_synonym_maps():
@@ -280,37 +844,70 @@ def _get_synonym_maps():
     return variant_map, variant_keys, category_map
 
 
+def _clear_synonym_cache():
+    _SYN_CACHE["ts"] = 0
+    _SYN_CACHE["variant_map"] = {}
+    _SYN_CACHE["variant_keys"] = []
+    _SYN_CACHE["category_map"] = {}
+
+
+def _normalize_phone_digits(value: str) -> str:
+    return re.sub(r"\D+", "", value or "")
+
+
 def _find_existing_candidate(
     cursor, available_cols, first_name, last_name, email, phone, selected_role
 ):
     """Return existing user_data id if we already have the same person for the same role."""
-    required_cols = {"id", "first_name", "last_name", "email", "phone", "selected_role"}
-    if not required_cols.issubset(available_cols):
+    if "selected_role" not in available_cols:
         return None
 
-    first = (first_name or "").strip()
-    last = (last_name or "").strip()
-    mail = (email or "").strip()
-    phone_norm = (phone or "").strip()
     role = (selected_role or "").strip()
-
-    if not (first and last and mail and phone_norm and role):
+    if not role:
         return None
 
-    lookup_sql = """
-        SELECT id
-        FROM user_data
-        WHERE first_name = %s
-          AND last_name = %s
-          AND email = %s
-          AND phone = %s
-          AND selected_role = %s
-        ORDER BY updated_at DESC
-        LIMIT 1
-    """
-    cursor.execute(lookup_sql, (first, last, mail, phone_norm, role))
-    row = cursor.fetchone()
-    return row[0] if row else None
+    email_norm = (email or "").strip().lower() if "email" in available_cols else ""
+    phone_norm = _normalize_phone_digits(phone) if "phone" in available_cols else ""
+
+    if not email_norm and not phone_norm:
+        return None
+
+    if email_norm:
+        cursor.execute(
+            """
+            SELECT id
+            FROM user_data
+            WHERE selected_role = %s
+              AND LOWER(email) = %s
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (role, email_norm),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+    if phone_norm:
+        phone_sql = (
+            "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone,'-',''),' ',''),'(',''),')',''),'+',''),'.','')"
+        )
+        cursor.execute(
+            f"""
+            SELECT id
+            FROM user_data
+            WHERE selected_role = %s
+              AND {phone_sql} = %s
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (role, phone_norm),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+    return None
 
 
 def process_and_sync_resume(
@@ -387,6 +984,7 @@ def process_and_sync_resume(
             variant_map=variant_map,
             variant_keys=variant_keys,
             category_map=category_map,
+            resume_text=data.get("full_text_clean") or "",
         )
 
     status_value = force_status or preserve_status or "new"
@@ -504,6 +1102,57 @@ def process_and_sync_resume(
     conn.close()
     return {"db_id": candidate_id, **doc}
 
+
+def reprocess_candidate(candidate_id):
+    """Reload candidate resume from disk, re-run parsing + scoring, and update DB."""
+    db = connect_mysql()
+    if not db:
+        raise ValueError("Database unavailable")
+
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        """
+        SELECT id, first_name, last_name, email, phone, selected_role, cv_filename
+        FROM user_data
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (candidate_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        cursor.close()
+        db.close()
+        raise ValueError("Candidate not found")
+
+    resume_name = row.get("cv_filename")
+    file_path = os.path.join(BASE_DIR, "Uploaded_Resumes", resume_name) if resume_name else None
+    if not file_path or not os.path.exists(file_path):
+        cursor.close()
+        db.close()
+        raise FileNotFoundError("Original resume file not found on disk.")
+
+    payload = analyze_and_extract(file_path, original_name=resume_name)
+    result = process_and_sync_resume(
+        path=file_path,
+        first_name=row.get("first_name", ""),
+        last_name=row.get("last_name", ""),
+        email=row.get("email", ""),
+        phone=row.get("phone", ""),
+        selected_role=row.get("selected_role") or "",
+        existing_id=row.get("id"),
+        resume_text=payload.get("text"),
+        doc_kind=payload.get("doc_kind"),
+        extraction_method=payload.get("extraction_method"),
+        ocr_used=payload.get("ocr_used"),
+        extraction_error=payload.get("extraction_error"),
+        file_mime=payload.get("file_mime"),
+        original_filename=resume_name,
+    )
+    cursor.close()
+    db.close()
+    return result
+
 def _build_applications_filters(
     status=None,
     role=None,
@@ -588,6 +1237,11 @@ def fetch_applications(
             updated_at,
             resume_score,
             jd_match_score,
+            skills_hard,
+            skills_soft,
+            skills_hard_canonical,
+            skills_soft_canonical,
+            full_text_clean,
             (SELECT COUNT(*) FROM user_feedback uf WHERE uf.user_id = user_data.id) AS notes_count
         FROM user_data
         WHERE {filters_sql}
@@ -612,7 +1266,83 @@ def fetch_applications(
             query,
             [*filter_params, page_size, offset],
         )
-        rows = _serialize_rows(cursor.fetchall())
+        raw_rows = cursor.fetchall() or []
+
+        def _decode_json_list(value):
+            if not value:
+                return []
+            if isinstance(value, list):
+                return value
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="ignore")
+            try:
+                parsed = json.loads(value) if isinstance(value, str) else value
+            except Exception:
+                return []
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, str):
+                return [parsed]
+            return []
+
+        variant_map, variant_keys, category_map = _get_synonym_maps()
+        for row in raw_rows:
+            role_name = row.get("selected_role") or ""
+            jd_keywords = _get_role_keywords(role_name) if role_name else []
+            jd_keyword_count = len(jd_keywords or [])
+            resume_tokens = _decode_json_list(row.get("skills_hard_canonical")) + _decode_json_list(
+                row.get("skills_soft_canonical")
+            )
+            if not resume_tokens:
+                resume_tokens = _decode_json_list(row.get("skills_hard")) + _decode_json_list(row.get("skills_soft"))
+
+            resume_text = row.get("full_text_clean") or ""
+            match_details = compute_weighted_jd_match(
+                resume_tokens,
+                _serialize_rows(jd_keywords),
+                variant_map=variant_map,
+                variant_keys=variant_keys,
+                category_map=category_map,
+                resume_text=resume_text,
+            )
+            jd_match = {
+                "score": row.get("jd_match_score") or 0,
+                "matched_count": 0,
+                "missing_count": 0,
+                "matched_preview": [],
+                "missing_preview": [],
+                "jd_keyword_count": jd_keyword_count,
+                "reason": "",
+            }
+            if match_details:
+                jd_match.update(
+                    {
+                        "score": match_details.get("score", 0),
+                        "matched_count": len(match_details.get("matched") or []),
+                        "missing_count": len(match_details.get("missing") or []),
+                        "matched_preview": (match_details.get("matched") or [])[:6],
+                        "missing_preview": (match_details.get("missing") or [])[:6],
+                    }
+                )
+            else:
+                if not role_name:
+                    jd_match["reason"] = "No role selected"
+                elif jd_keyword_count == 0:
+                    jd_match["reason"] = "No JD keywords saved for this role"
+                elif not resume_tokens and not (resume_text or "").strip():
+                    jd_match["reason"] = "No extracted text yet (OCR needed?)"
+                else:
+                    jd_match["reason"] = "Not enough data to score"
+            row["jd_match"] = jd_match
+
+            # drop heavy fields from list response
+            row.pop("full_text_clean", None)
+            row.pop("skills_hard", None)
+            row.pop("skills_soft", None)
+            row.pop("skills_hard_canonical", None)
+            row.pop("skills_soft_canonical", None)
+
+        rows = _serialize_rows(raw_rows)
 
         cursor.execute(status_summary_query)
         status_summary = cursor.fetchall()
@@ -749,6 +1479,7 @@ def fetch_candidate_detail(user_id):
             variant_map=variant_map,
             variant_keys=variant_keys,
             category_map=category_map,
+            resume_text=user.get("full_text_clean") or "",
         )
 
         return {
@@ -791,6 +1522,34 @@ def add_candidate_note(user_id, comment):
     try:
         cursor = db.cursor()
         cursor.execute(query, (user_id, comment))
+        db.commit()
+        cursor.close()
+        db.close()
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def update_candidate_resume_score(user_id: int, resume_score):
+    db = connect_mysql()
+    if not db:
+        return False
+    try:
+        score = float(resume_score)
+    except Exception:
+        return False
+    if score < 0:
+        score = 0.0
+    if score > 100:
+        score = 100.0
+
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            "UPDATE user_data SET resume_score=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+            (score, int(user_id)),
+        )
         db.commit()
         cursor.close()
         db.close()
@@ -1039,80 +1798,205 @@ def set_role_visibility(role_id, is_open=True):
         return False
 
 
-def analytics_overview():
+def _parse_date_yyyy_mm_dd(value):
+    if not value:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _daterange_days(start_d: date, end_d: date):
+    cur = start_d
+    while cur <= end_d:
+        yield cur
+        cur = cur + timedelta(days=1)
+
+
+def analytics_overview(start_date=None, end_date=None, role=None):
     db = connect_mysql()
     if not db:
         return {
+            "scope": {"start_date": None, "end_date": None, "role": role},
+            "totals": {"total_applications": 0, "avg_jd_match_score": 0, "avg_resume_score": 0},
             "status_breakdown": [],
             "applications_over_time": [],
             "top_roles": [],
-            "match_distribution": [],
+            "jd_match_distribution": [],
+            "experience_distribution": [],
+            "doc_kind_breakdown": [],
         }
 
     try:
         cursor = db.cursor(dictionary=True)
 
+        start_d = _parse_date_yyyy_mm_dd(start_date)
+        end_d = _parse_date_yyyy_mm_dd(end_date)
+        today = date.today()
+        if not end_d:
+            end_d = today
+        if not start_d:
+            start_d = end_d - timedelta(days=89)
+
+        # Build scoped WHERE clause (date + role)
+        where = ["created_at >= %s", "created_at < DATE_ADD(%s, INTERVAL 1 DAY)"]
+        params = [start_d.isoformat(), end_d.isoformat()]
+        if role:
+            where.append("selected_role = %s")
+            params.append(role)
+        where_sql = "WHERE " + " AND ".join(where)
+
         cursor.execute(
-            "SELECT status, COUNT(*) AS count FROM user_data GROUP BY status ORDER BY count DESC"
+            f"""
+            SELECT
+              COUNT(*) AS total_applications,
+              AVG(jd_match_score) AS avg_jd_match_score,
+              AVG(resume_score) AS avg_resume_score
+            FROM user_data
+            {where_sql}
+            """,
+            tuple(params),
+        )
+        totals_row = cursor.fetchone() or {}
+        totals = {
+            "total_applications": int(totals_row.get("total_applications") or 0),
+            "avg_jd_match_score": float(totals_row.get("avg_jd_match_score") or 0),
+            "avg_resume_score": float(totals_row.get("avg_resume_score") or 0),
+        }
+
+        cursor.execute(
+            f"SELECT status, COUNT(*) AS count FROM user_data {where_sql} GROUP BY status ORDER BY count DESC",
+            tuple(params),
         )
         status_breakdown = _serialize_rows(cursor.fetchall())
 
         cursor.execute(
-            """
+            f"""
             SELECT DATE(created_at) AS date, COUNT(*) AS count
             FROM user_data
-            WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+            {where_sql}
             GROUP BY DATE(created_at)
             ORDER BY DATE(created_at)
-            """
+            """,
+            tuple(params),
         )
-        over_time = _serialize_rows(cursor.fetchall())
+        over_time_rows = _serialize_rows(cursor.fetchall())
+        # Fill missing days for nicer charting
+        over_time_map = {(row.get("date") or ""): int(row.get("count") or 0) for row in over_time_rows}
+        over_time = []
+        for day in _daterange_days(start_d, end_d):
+            day_str = day.isoformat()
+            over_time.append({"date": day_str, "count": over_time_map.get(day_str, 0)})
 
         cursor.execute(
-            """
+            f"""
             SELECT selected_role AS role, COUNT(*) AS count
             FROM user_data
+            {where_sql}
             GROUP BY selected_role
             ORDER BY count DESC
-            LIMIT 5
-            """
+            LIMIT 10
+            """,
+            tuple(params),
         )
         top_roles = _serialize_rows(cursor.fetchall())
 
         cursor.execute(
-            """
+            f"""
             SELECT
                 CASE
-                    WHEN jd_match_score >= 80 THEN '80-100'
-                    WHEN jd_match_score >= 60 THEN '60-79'
-                    WHEN jd_match_score >= 40 THEN '40-59'
-                    WHEN jd_match_score >= 20 THEN '20-39'
-                    ELSE '0-19'
+                    WHEN jd_match_score >= 90 THEN '90-100'
+                    WHEN jd_match_score >= 80 THEN '80-89'
+                    WHEN jd_match_score >= 70 THEN '70-79'
+                    WHEN jd_match_score >= 60 THEN '60-69'
+                    WHEN jd_match_score >= 50 THEN '50-59'
+                    WHEN jd_match_score >= 40 THEN '40-49'
+                    WHEN jd_match_score >= 30 THEN '30-39'
+                    WHEN jd_match_score >= 20 THEN '20-29'
+                    WHEN jd_match_score >= 10 THEN '10-19'
+                    ELSE '0-9'
                 END AS bucket,
                 COUNT(*) AS count
             FROM user_data
+            {where_sql}
             GROUP BY bucket
             ORDER BY bucket DESC
-            """
+            """,
+            tuple(params),
         )
-        match_distribution = _serialize_rows(cursor.fetchall())
+        jd_match_distribution = _serialize_rows(cursor.fetchall())
+
+        cursor.execute(
+            f"SELECT experience_years FROM user_data {where_sql} AND experience_years IS NOT NULL",
+            tuple(params),
+        )
+        exp_rows = cursor.fetchall() or []
+        exp_buckets = Counter()
+        for row in exp_rows:
+            val = row.get("experience_years")
+            try:
+                years = float(val or 0)
+            except Exception:
+                years = 0.0
+            if years <= 0:
+                exp_buckets["0"] += 1
+            elif years < 3:
+                exp_buckets["1-2"] += 1
+            elif years < 6:
+                exp_buckets["3-5"] += 1
+            elif years < 10:
+                exp_buckets["6-9"] += 1
+            else:
+                exp_buckets["10+"] += 1
+        experience_distribution = [{"bucket": k, "count": exp_buckets.get(k, 0)} for k in ["0", "1-2", "3-5", "6-9", "10+"]]
+
+        doc_kind_breakdown = []
+        try:
+            cursor.execute(
+                f"""
+                SELECT
+                  JSON_UNQUOTE(JSON_EXTRACT(doc_metadata, '$.doc_kind')) AS doc_kind,
+                  COUNT(*) AS count
+                FROM user_data
+                {where_sql}
+                GROUP BY doc_kind
+                ORDER BY count DESC
+                """,
+                tuple(params),
+            )
+            doc_kind_breakdown = _serialize_rows(cursor.fetchall())
+        except Exception:
+            doc_kind_breakdown = []
 
         cursor.close()
         db.close()
 
         return {
+            "scope": {"start_date": start_d.isoformat(), "end_date": end_d.isoformat(), "role": role or ""},
+            "totals": totals,
             "status_breakdown": status_breakdown,
             "applications_over_time": over_time,
             "top_roles": top_roles,
-            "match_distribution": match_distribution,
+            "jd_match_distribution": jd_match_distribution,
+            "experience_distribution": experience_distribution,
+            "doc_kind_breakdown": doc_kind_breakdown,
         }
     except Exception:
         traceback.print_exc()
         return {
+            "scope": {"start_date": None, "end_date": None, "role": role},
+            "totals": {"total_applications": 0, "avg_jd_match_score": 0, "avg_resume_score": 0},
             "status_breakdown": [],
             "applications_over_time": [],
             "top_roles": [],
-            "match_distribution": [],
+            "jd_match_distribution": [],
+            "experience_distribution": [],
+            "doc_kind_breakdown": [],
         }
 
 

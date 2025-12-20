@@ -19,6 +19,12 @@ const SORT_OPTIONS = [
   { value: 'jd_match_score', label: 'JD match' },
 ]
 
+const formatPercent = (value) => {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '0%'
+  return `${Math.round(num)}%`
+}
+
 export default function HRDashboard() {
   const [filters, setFilters] = useState({
     status: '',
@@ -67,6 +73,7 @@ export default function HRDashboard() {
         setStats({})
       })
       .finally(() => setLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(filters)])
 
   const cards = useMemo(() => {
@@ -91,8 +98,8 @@ export default function HRDashboard() {
         label: 'Avg Resume Score',
         value:
           typeof overview?.avg_resume_score === 'number'
-            ? overview.avg_resume_score.toFixed(1)
-            : '0.0',
+            ? overview.avg_resume_score.toFixed(1) + '%'
+            : '0.0%',
         helper: 'Based on parsed CV scores',
       },
     ]
@@ -108,12 +115,52 @@ export default function HRDashboard() {
     }))
   }
 
+  const renderScoreCell = (app) => {
+    const jdMatch = app.jd_match || {}
+    const jdScore = jdMatch.score ?? app.jd_match_score ?? 0
+    const resumeScore = app.resume_score ?? 0
+    const matchedCount = jdMatch.matched_count ?? 0
+    const missingCount = jdMatch.missing_count ?? 0
+    const jdReason = jdMatch.reason || ''
+    const jdKeywordCount = jdMatch.jd_keyword_count ?? null
+
+    return (
+      <div className="score-cell">
+        <div className="score-row">
+          <span className="score-label">Resume</span>
+          <strong>{formatPercent(resumeScore)}</strong>
+        </div>
+        <div className="score-row">
+          <span className="score-label">JD</span>
+          <strong>{formatPercent(jdScore)}</strong>
+        </div>
+        {(matchedCount > 0 || missingCount > 0) && (
+          <div className="score-sub">
+            Matched <strong>{matchedCount}</strong> / Missing <strong>{missingCount}</strong>
+          </div>
+        )}
+        {(jdReason || jdKeywordCount !== null) && (
+          <div className="score-sub">
+            {jdKeywordCount !== null ? (
+              <>
+                Keywords <strong>{jdKeywordCount}</strong>
+                {jdReason ? <> · {jdReason}</> : null}
+              </>
+            ) : (
+              jdReason
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="dashboard">
       <div className="dashboard-header">
         <div>
           <h2>HR Dashboard</h2>
-          <p>Monitor your talent pipeline and refine applications with flexible filters.</p>
+          <p>Monitor your talent pipeline and manage applications with powerful filters</p>
         </div>
       </div>
 
@@ -127,11 +174,11 @@ export default function HRDashboard() {
         ))}
       </section>
 
-      <section className="filter-panel card">
+      <section className="filter-panel">
         <div className="filter-panel-header">
           <div>
-            <h3>Filters</h3>
-            <p>Choose statuses, roles, and date windows to refine the list.</p>
+            <h3>Filter Applications</h3>
+            <p>Refine your view by status, role, date range, and keywords</p>
           </div>
         </div>
         <div className="filter-grid">
@@ -176,13 +223,13 @@ export default function HRDashboard() {
             Keyword search
             <input
               type="text"
-              placeholder="Search name, email, or role"
+              placeholder="Search by name, email, or role..."
               value={filters.keyword}
               onChange={(e) => handleFilterChange('keyword', e.target.value)}
             />
           </label>
           <label>
-            Sort field
+            Sort by
             <select value={filters.sort_by} onChange={(e) => handleFilterChange('sort_by', e.target.value)}>
               {SORT_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -194,8 +241,8 @@ export default function HRDashboard() {
           <label>
             Direction
             <select value={filters.sort_dir} onChange={(e) => handleFilterChange('sort_dir', e.target.value)}>
-              <option value="desc">Desc</option>
-              <option value="asc">Asc</option>
+              <option value="desc">Descending</option>
+              <option value="asc">Ascending</option>
             </select>
           </label>
         </div>
@@ -217,83 +264,95 @@ export default function HRDashboard() {
             ))}
           </div>
         </div>
+        
         {error && <div className="table-error">{error}</div>}
+        
         {loading ? (
           <p className="table-empty">Loading applications...</p>
         ) : applications.length === 0 ? (
           <p className="table-empty">No applications found for the selected filters.</p>
         ) : (
-          <div className="table-scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>Candidate</th>
-                  <th>Email</th>
-                  <th>Role</th>
-                  <th>Status</th>
-                  <th>Applied</th>
-                  <th>Updated</th>
-                  <th>Notes</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {applications.map((app) => (
-                  <tr key={app.id}>
-                    <td>
-                      <div className="candidate-cell">
-                        <strong>{app.name || 'Unknown'}</strong>
-                      </div>
-                    </td>
-                    <td>{app.email || 'N/A'}</td>
-                    <td>{app.selected_role || '—'}</td>
-                    <td>
-                      <span className={`status-pill status-${app.status}`}>{app.status}</span>
-                    </td>
-                    <td>
-                      <div className="date-cell">
-                        <span>Applied</span>
-                        <strong>{new Date(app.created_at).toLocaleDateString()}</strong>
-                      </div>
-                    </td>
-                    <td>
-                      <div className="date-cell">
-                        <span>Updated</span>
-                        <strong>{new Date(app.updated_at).toLocaleDateString()}</strong>
-                      </div>
-                    </td>
-                    <td><div className="notes-badge">{app.notes_count}</div></td>
-                    <td>
-                      <div className="action-stack">
-                        <Link to={`/hr/candidates/${app.id}`} className="primary-btn small">
-                          View profile
-                        </Link>
-                      </div>
-                    </td>
+          <>
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Candidate</th>
+                    <th>Email</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Scores</th>
+                    <th>Applied</th>
+                    <th>Updated</th>
+                    <th>Notes</th>
+                    <th>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+                </thead>
+                <tbody>
+                  {applications.map((app) => (
+                    <tr key={app.id}>
+                      <td>
+                        <div className="candidate-cell">
+                          <strong>{app.name || 'Unknown'}</strong>
+                        </div>
+                      </td>
+                      <td>
+                        <span style={{ color: 'var(--text-secondary)' }}>{app.email || 'N/A'}</span>
+                      </td>
+                      <td>
+                        <span style={{ color: 'var(--text-secondary)' }}>{app.selected_role || '—'}</span>
+                      </td>
+                      <td>
+                        <span className={`status-pill status-${app.status}`}>{app.status}</span>
+                      </td>
+                      <td>{renderScoreCell(app)}</td>
+                      <td>
+                        <div className="date-cell">
+                          <span>Applied</span>
+                          <strong>{new Date(app.created_at).toLocaleDateString()}</strong>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="date-cell">
+                          <span>Updated</span>
+                          <strong>{new Date(app.updated_at).toLocaleDateString()}</strong>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="notes-badge">{app.notes_count || 0}</div>
+                      </td>
+                      <td>
+                        <div className="action-stack">
+                          <Link to={`/hr/candidates/${app.id}`} className="primary-btn small">
+                            View Profile
+                          </Link>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
 
-        <div className="table-pagination">
-          <button
-            onClick={() => handleFilterChange('page', Math.max(1, filters.page - 1))}
-            disabled={filters.page <= 1}
-          >
-            Previous
-          </button>
-          <span>
-            Page {filters.page} / {totalPages}
-          </span>
-          <button
-            onClick={() => handleFilterChange('page', Math.min(totalPages, filters.page + 1))}
-            disabled={filters.page >= totalPages}
-          >
-            Next
-          </button>
-        </div>
+            <div className="table-pagination">
+              <button
+                onClick={() => handleFilterChange('page', Math.max(1, filters.page - 1))}
+                disabled={filters.page <= 1}
+              >
+                Previous
+              </button>
+              <span>
+                Page {filters.page} of {totalPages}
+              </span>
+              <button
+                onClick={() => handleFilterChange('page', Math.min(totalPages, filters.page + 1))}
+                disabled={filters.page >= totalPages}
+              >
+                Next
+              </button>
+            </div>
+          </>
+        )}
       </section>
     </div>
   )

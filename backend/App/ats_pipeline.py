@@ -99,10 +99,13 @@ def _coerce_weight(weight_value, importance_value: Optional[str]) -> float:
 def _token_present(
     canonical_keyword: str,
     resume_tokens: Set[str],
+    resume_text_norm: Optional[str] = None,
     fuzzy_threshold: float = 0.9,
 ) -> bool:
     """Return True if the canonical keyword exists in the resume token set."""
     if canonical_keyword in resume_tokens:
+        return True
+    if resume_text_norm and canonical_keyword and canonical_keyword in resume_text_norm:
         return True
     for token in resume_tokens:
         if SequenceMatcher(None, canonical_keyword, token).ratio() >= fuzzy_threshold:
@@ -117,6 +120,7 @@ def compute_weighted_jd_match(
     variant_keys: Optional[Sequence[str]] = None,
     *,
     category_map: Optional[Dict[str, str]] = None,
+    resume_text: Optional[str] = None,
     fuzzy_threshold: float = 0.9,
 ) -> Optional[Dict[str, object]]:
     """
@@ -132,15 +136,18 @@ def compute_weighted_jd_match(
     Returns:
         dict with score, matched keywords, missing keywords, and weight stats.
     """
-    if not resume_skills or not jd_keywords:
+    if not jd_keywords:
         return None
 
     variant_map = variant_map or {}
     variant_keys = variant_keys or list(variant_map.keys())
-    resume_tokens = canonicalize_skills(
-        resume_skills, variant_map=variant_map, variant_keys=variant_keys
-    )
-    if not resume_tokens:
+    resume_tokens: Set[str] = set()
+    if resume_skills:
+        resume_tokens = canonicalize_skills(
+            resume_skills, variant_map=variant_map, variant_keys=variant_keys
+        )
+    resume_text_norm = normalize_skill_token(resume_text or "")
+    if not resume_tokens and not resume_text_norm:
         return None
 
     matched_keywords: List[str] = []
@@ -157,7 +164,12 @@ def compute_weighted_jd_match(
         )
         weight = _coerce_weight(row.get("weight"), row.get("importance"))
         total_weight += weight
-        if _token_present(canonical_kw, resume_tokens, fuzzy_threshold=fuzzy_threshold):
+        if _token_present(
+            canonical_kw,
+            resume_tokens,
+            resume_text_norm=resume_text_norm,
+            fuzzy_threshold=fuzzy_threshold,
+        ):
             matched_keywords.append(raw_keyword)
             matched_weight += weight
         else:
@@ -177,4 +189,3 @@ def compute_weighted_jd_match(
         "coverage": matched_weight / total_weight if total_weight else 0.0,
         "categories": category_map or {},
     }
-

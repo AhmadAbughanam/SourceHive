@@ -1,6 +1,4 @@
 import os
-import io
-import spacy
 from spacy.matcher import Matcher
 from . import utils
 
@@ -24,8 +22,8 @@ class ResumeParser:
         self.variant_keys = list(self.variant_map.keys())
         self.original_filename = original_filename
 
-        # Load SpaCy model once
-        self.nlp = spacy.load("en_core_web_sm")
+        # Use shared SpaCy model so vocab matches PhraseMatcher patterns
+        self.nlp = utils.get_nlp()
         self.matcher = Matcher(self.nlp.vocab)
 
         # Extract text (OCR-aware if available)

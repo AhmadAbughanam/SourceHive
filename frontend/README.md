@@ -1,34 +1,35 @@
-# SourceHive Frontend - React
+# SourceHive Frontend (Vite + React)
 
-This folder will contain the React frontend for SourceHive.
+HR-facing UI + candidate-only AI interview portal.
+
+## Requirements
+
+- Node.js 18+
+- Backend running on `http://localhost:8000`
 
 ## Setup
 
+From repo root:
+
 ```bash
-npm create vite@latest . -- --template react
+cd frontend
 npm install
 npm run dev
 ```
 
-## Structure
+Vite will print the local URL (usually `http://localhost:5173`).
 
-- `/src/components` - React components
-- `/src/pages` - Page components
-- `/src/api` - API client functions
+## API Base URL
 
-## Environment
+The API URL is currently defined in `src/api/client.js` as:
 
-Create a `.env` file:
-
-```
-VITE_API_URL=http://localhost:8000/api
+```js
+const API_BASE = 'http://localhost:8000/api'
 ```
 
-## API Integration
+If you run the backend on a different host/port, update that constant.
 
-The frontend connects to the backend at `http://localhost:8000`
+## Routes (high level)
 
-Endpoints:
-
-- `GET /api/health` - Health check
-- `POST /api/resume/upload` - Upload and process resume
+- HR app: `/` (dashboard), plus HR pages (roles, analytics, candidates)
+- Candidate interview portal (no HR sidebar): `/interview?token=...`
